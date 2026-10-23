@@ -1,0 +1,1696 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+URI="${LSO_URI:-qemu:///system}"
+LSO_BASE_DIR="${LSO_BASE_DIR:-$HOME/.lso}"
+# Optional explicit opt-in to an existing legacy omarchy-vm workspace (absolute dir). Never auto-detected.
+LSO_LEGACY_HOME="${LSO_LEGACY_HOME:-}"
+if [[ -n "$LSO_LEGACY_HOME" && "$LSO_LEGACY_HOME" != /* ]]; then
+  echo "ERROR: LSO_LEGACY_HOME must be an absolute directory path: $LSO_LEGACY_HOME" >&2
+  exit 1
+fi
+
+# Global flags before subcommand: lso [-n|--name <name>] <subcommand> ...
+TARGET_NAME="${LSO_NAME:-}"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -n|--name)
+      TARGET_NAME="$2"
+      shift 2
+      ;;
+    --name=*)
+      TARGET_NAME="${1#*=}"
+      shift
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+resolve_instance() {
+  local name="${1:-}"
+
+  # Explicit instance name
+  if [[ -n "$name" ]]; then
+    if [[ "$name" == "omarchy-vm" || "$name" == "default" ]] && [[ -n "$LSO_LEGACY_HOME" && -f "$LSO_LEGACY_HOME/omarchy-vm.xml" && ! -d "$LSO_BASE_DIR/$name" ]]; then
+      VM="omarchy-vm"
+      LSO_DIR="$LSO_LEGACY_HOME"
+      XML_FILE="$LSO_LEGACY_HOME/omarchy-vm.xml"
+      DISK_FILE="$LSO_LEGACY_HOME/omarchy-vm.raw"
+      return 0
+    fi
+    LSO_DIR="$LSO_BASE_DIR/$name"
+    VM="lso-$name"
+    XML_FILE="$LSO_DIR/domain.xml"
+    DISK_FILE="$LSO_DIR/disk.raw"
+    return 0
+  fi
+
+  # Default instance resolution:
+  # 1. ~/.lso/current pointer if set and valid
+  if [[ -f "$LSO_BASE_DIR/current" ]]; then
+    local cur
+    cur="$(<"$LSO_BASE_DIR/current")"
+    if [[ -n "$cur" && -f "$LSO_BASE_DIR/$cur/domain.xml" ]]; then
+      LSO_DIR="$LSO_BASE_DIR/$cur"
+      VM="lso-$cur"
+      XML_FILE="$LSO_DIR/domain.xml"
+      DISK_FILE="$LSO_DIR/disk.raw"
+      return 0
+    fi
+  fi
+
+  # 2. Direct ~/.lso/domain.xml if present
+  if [[ -f "$LSO_BASE_DIR/domain.xml" ]]; then
+    LSO_DIR="$LSO_BASE_DIR"
+    VM="lso-vm"
+    XML_FILE="$LSO_DIR/domain.xml"
+    DISK_FILE="$LSO_DIR/disk.raw"
+    return 0
+  fi
+
+  # 3. Explicit legacy omarchy-vm (only when LSO_LEGACY_HOME is set)
+  if [[ -n "$LSO_LEGACY_HOME" && -f "$LSO_LEGACY_HOME/omarchy-vm.xml" ]]; then
+    VM="omarchy-vm"
+    LSO_DIR="$LSO_LEGACY_HOME"
+    XML_FILE="$LSO_LEGACY_HOME/omarchy-vm.xml"
+    DISK_FILE="$LSO_LEGACY_HOME/omarchy-vm.raw"
+    return 0
+  fi
+
+  # 4. First instance under ~/.lso/*/domain.xml
+  local first_xml
+  first_xml="$(compgen -G "$LSO_BASE_DIR/*/domain.xml" | head -n 1 || true)"
+  if [[ -n "$first_xml" ]]; then
+    LSO_DIR="$(dirname "$first_xml")"
+    local inst_name
+    inst_name="$(basename "$LSO_DIR")"
+    VM="lso-$inst_name"
+    XML_FILE="$first_xml"
+    DISK_FILE="$LSO_DIR/disk.raw"
+    return 0
+  fi
+
+  # Fallback
+  LSO_DIR="$LSO_BASE_DIR/default"
+  VM="lso-default"
+  XML_FILE="$LSO_DIR/domain.xml"
+  DISK_FILE="$LSO_DIR/disk.raw"
+}
+
+apply_resource_preset() {
+  local preset="${1:-default}"
+  case "$preset" in
+    low|min|minimum)
+      INSTALL_CPUS=2
+      INSTALL_RAM_MIB=3072
+      INSTALL_DISK_GIB=36
+      ;;
+    default|medium|normal|standard)
+      INSTALL_CPUS=4
+      INSTALL_RAM_MIB=4096
+      INSTALL_DISK_GIB=40
+      ;;
+    high|max|performance)
+      INSTALL_CPUS=8
+      INSTALL_RAM_MIB=8192
+      INSTALL_DISK_GIB=64
+      ;;
+    *)
+      echo "ERROR: Unknown --resource preset '$preset' (use: low, default, high)" >&2
+      exit 1
+      ;;
+  esac
+}
+
+LSO_DEFAULT_ISO_URL="https://iso.omarchy.org/omarchy-4.0.6.iso"
+
+# Print the default cached ISO path (never touches the script install dir).
+default_iso_cache_path() {
+  printf '%s\n' "$LSO_BASE_DIR/cache/omarchy-4.0.6.iso"
+}
+
+# Download the pinned default ISO into the cache unless a nonempty copy exists.
+# The final filename only appears after curl succeeds and the file is nonempty.
+# This is a basic completeness check, not cryptographic verification.
+ensure_default_iso() {
+  local dest part cache_dir
+  dest="$(default_iso_cache_path)"
+  part="$dest.part"
+  cache_dir="$(dirname "$dest")"
+  if [[ -s "$dest" ]]; then
+    echo "==> Using cached Omarchy ISO: $dest"
+    return 0
+  fi
+  if ! command -v curl >/dev/null 2>&1; then
+    echo "ERROR: curl is required to download the default Omarchy ISO (sudo apt-get install -y curl), or pass --iso /path/to/omarchy.iso" >&2
+    exit 1
+  fi
+  mkdir -p "$cache_dir"
+  rm -f "$part"
+  echo "==> Downloading Omarchy ISO (~6 GiB) from $LSO_DEFAULT_ISO_URL"
+  echo "    Saving to: $dest"
+  local progress=(--silent)
+  [[ -t 2 ]] && progress=(--progress-bar)
+  if ! curl --fail --location --show-error "${progress[@]}" --output "$part" "$LSO_DEFAULT_ISO_URL"; then
+    rm -f "$part"
+    echo "ERROR: Download of $LSO_DEFAULT_ISO_URL failed; no VM or disk was created." >&2
+    echo "  Check your network and retry 'lso install', or download the ISO yourself and pass: lso install --iso /path/to/omarchy.iso" >&2
+    exit 1
+  fi
+  if [[ ! -s "$part" ]]; then
+    rm -f "$part"
+    echo "ERROR: Downloaded ISO is empty; no VM or disk was created. Retry 'lso install' or pass --iso /path/to/omarchy.iso" >&2
+    exit 1
+  fi
+  mv -f "$part" "$dest"
+  echo "==> Downloaded $dest (size check only; contents are not cryptographically verified)"
+}
+
+# Usage: check_host_requirements [default-iso]
+# Pass "default-iso" when no explicit ISO was given, so curl is checked only if a download is needed.
+check_host_requirements() {
+  local iso_mode="${1:-}"
+  local failed=0
+  local missing=()
+  local cmds=(
+    qemu-system-x86_64
+    virsh
+    virt-viewer
+    swtpm
+    xorriso
+    jq
+    openssl
+    ssh
+    ssh-keygen
+    setfacl
+    waypipe
+  )
+
+  _pf_row() { printf '  %-6s %-18s %s\n' "$1" "$2" "$3"; }
+
+  echo "==> Checking host commands & runtime requirements..."
+  local c path
+  for c in "${cmds[@]}"; do
+    if path="$(command -v "$c" 2>/dev/null)"; then
+      _pf_row "[OK]" "$c" "$path"
+    else
+      _pf_row "[MISSING]" "$c" "not found in PATH"
+      missing+=("$c")
+      failed=1
+    fi
+  done
+
+  if [[ "$iso_mode" != "default-iso" ]]; then
+    _pf_row "[SKIP]" "curl" "not needed (usable local ISO supplied)"
+  elif [[ -s "$(default_iso_cache_path)" ]]; then
+    _pf_row "[SKIP]" "curl" "not needed (cached ISO: $(default_iso_cache_path))"
+  elif path="$(command -v curl 2>/dev/null)"; then
+    _pf_row "[OK]" "curl" "$path (will download default ISO)"
+  else
+    _pf_row "[MISSING]" "curl" "required to download default ISO (sudo apt-get install -y curl)"
+    missing+=("curl")
+    failed=1
+  fi
+
+  if [[ -r /dev/kvm && -w /dev/kvm ]]; then
+    _pf_row "[OK]" "/dev/kvm" "readable and writable by $USER"
+  else
+    _pf_row "[FAIL]" "/dev/kvm" "not accessible by $USER (check KVM support and 'kvm' group membership)"
+    failed=1
+  fi
+
+  local ovmf_file
+  for ovmf_file in OVMF_CODE_4M.fd OVMF_VARS_4M.fd; do
+    if [[ -f "/usr/share/OVMF/$ovmf_file" ]]; then
+      _pf_row "[OK]" "$ovmf_file" "/usr/share/OVMF/$ovmf_file"
+    else
+      _pf_row "[MISSING]" "$ovmf_file" "/usr/share/OVMF/$ovmf_file (install 'ovmf')"
+      failed=1
+    fi
+  done
+
+  if command -v virsh >/dev/null 2>&1; then
+    if virsh -c "$URI" version >/dev/null 2>&1; then
+      _pf_row "[OK]" "libvirt" "connected to $URI"
+      if virsh -c "$URI" net-info default 2>/dev/null | awk '/^Active:/ {exit ($2=="yes"?0:1)}'; then
+        _pf_row "[OK]" "libvirt network" "'default' is active"
+      elif virsh -c "$URI" net-start default >/dev/null 2>&1; then
+        _pf_row "[OK]" "libvirt network" "'default' was inactive; started"
+      else
+        _pf_row "[FAIL]" "libvirt network" "'default' is inactive and could not be started"
+        failed=1
+      fi
+    else
+      _pf_row "[FAIL]" "libvirt" "cannot connect to $URI (is libvirtd running?)"
+      failed=1
+    fi
+  else
+    _pf_row "[FAIL]" "libvirt" "skipped; virsh is missing"
+  fi
+
+  local render_node
+  render_node="$(ls /dev/dri/by-path/*-render 2>/dev/null | head -n 1 || true)"
+  if [[ -z "$render_node" && -e /dev/dri/renderD128 ]]; then
+    render_node=/dev/dri/renderD128
+  fi
+  if [[ -n "$render_node" ]]; then
+    _pf_row "[OK]" "DRM render node" "$render_node"
+  else
+    _pf_row "[WARN]" "DRM render node" "none found; 3D VirGL acceleration may be unavailable"
+  fi
+
+  if (( ${#missing[@]} > 0 )); then
+    echo "ERROR: Missing required host commands: ${missing[*]}" >&2
+    echo "Install them on Ubuntu with:" >&2
+    echo "  sudo apt-get install -y qemu-system-x86 libvirt-daemon-system libvirt-clients virt-viewer swtpm xorriso jq openssl openssh-client acl waypipe ovmf curl" >&2
+  fi
+  if (( failed )); then
+    echo "ERROR: Host preflight failed; fix the items marked above." >&2
+    exit 1
+  fi
+
+  echo "Host preflight passed."
+}
+
+ensure_dir_acls() {
+  local target_dir="$1"
+  mkdir -p "$target_dir"
+  local cur="$target_dir"
+  while [[ "$cur" != "/" && "$cur" != "." ]]; do
+    setfacl -m u:libvirt-qemu:x "$cur" 2>/dev/null || true
+    cur="$(dirname "$cur")"
+  done
+  setfacl -m u:libvirt-qemu:rwx "$target_dir" 2>/dev/null || true
+}
+
+get_vm_ip() {
+  local vm_target="${1:-$VM}"
+  virsh -c "$URI" domifaddr "$vm_target" --source agent 2>/dev/null | awk '/ipv4/ && $1 != "lo" {split($4, a, "/"); print a[1]; exit}' \
+    || virsh -c "$URI" domifaddr "$vm_target" 2>/dev/null | awk '/ipv4/ {split($4, a, "/"); print a[1]; exit}'
+}
+
+get_ip() {
+  get_vm_ip "$VM"
+}
+
+is_running() {
+  virsh -c "$URI" domstate "$VM" 2>/dev/null | grep -q "running"
+}
+
+# Start the domain if needed without waiting for SSH, so the display can be
+# attached to inspect an installer/OOBE/boot screen even when SSH is unusable.
+start_vm_if_needed() {
+  if ! is_running; then
+    if [[ ! -f "$XML_FILE" ]]; then
+      echo "No VM configured at $XML_FILE. Run 'lso list' or 'lso install' first." >&2
+      exit 1
+    fi
+    echo "Starting $VM..." >&2
+    virsh -c "$URI" define "$XML_FILE" >/dev/null
+    virsh -c "$URI" start "$VM" >/dev/null
+  fi
+}
+
+# Print why key-based SSH to $GUEST_USER@$1 fails (stderr of one probe; no secrets involved).
+explain_ssh_failure() {
+  local ip="$1" err
+  err="$(ssh "${SSH_OPTS[@]}" -o LogLevel=ERROR -o ConnectTimeout=3 "${GUEST_USER}@${ip}" true </dev/null 2>&1 >/dev/null | head -n 5 || true)"
+  if [[ "$err" == *"REMOTE HOST IDENTIFICATION HAS CHANGED"* || "$err" == *"Host key verification failed"* ]]; then
+    echo "  Cause: SSH host key mismatch (a different system, e.g. the live ISO, was seen at $ip before)." >&2
+    echo "  Fix:   ssh-keygen -R $ip -f '$LSO_DIR/known_hosts'" >&2
+  elif [[ -n "$err" ]]; then
+    echo "  SSH said: ${err//$'\n'/ | }" >&2
+  fi
+}
+
+ensure_running() {
+  start_vm_if_needed
+  local ip=""
+  for _ in {1..40}; do
+    ip="$(get_ip)"
+    if [[ -n "$ip" ]] && ssh "${SSH_OPTS[@]}" -o ConnectTimeout=1 "${GUEST_USER}@${ip}" true </dev/null >/dev/null 2>&1; then
+      echo "$ip"
+      return 0
+    fi
+    sleep 0.5
+  done
+  echo "Timed out waiting for $VM SSH (state: $(virsh -c "$URI" domstate "$VM" 2>/dev/null | head -n 1), ip: ${ip:-none})." >&2
+  [[ -n "$ip" ]] && explain_ssh_failure "$ip"
+  echo "  The desktop does not need SSH: run 'lso -n ${LSO_DIR##*/} desktop' to see the VM screen." >&2
+  exit 1
+}
+
+# ── Omarchy CLI Logo & Tracing Icon Animation (from omarchy-install-dashboard) ──
+OMARCHY_WHIMSY=(
+  "delivering delightful defaults"
+  "saving setup struggles"
+  "picking polished packages"
+  "curating cohesive colors"
+  "preparing pleasant pixels"
+  "hyping happy hyprland"
+  "integrating intuitive interfaces"
+  "bootstrapping beautiful boxes"
+  "crafting cozy commands"
+  "making machines marvelous"
+  "polishing pretty pixels"
+  "tuning tasteful terminals"
+  "weaving wonderful workflows"
+)
+
+print_lso_banner() {
+  local LC_ALL=C.UTF-8
+  local subtitle="${1:-handy and funny setup helper}"
+  local title='Linux Subsystem for Omarchy (LSO)'
+
+  local c=$'\e[38;2;125;207;255m' d=$'\e[38;2;86;95;137m' r=$'\e[0m' i
+  # Delta Corps Priest 1 by CoSMiC cHiLD; counters condensed to match Omarchy.
+  local -a rows=(
+    ' ▄█          ▄███████   ▄█████▄'
+    '███         ███   ███  ███   ███'
+    '███         ███   █▀   ███   ███'
+    '███         ███        ███   ███'
+    '███       ▀██████████  ███   ███'
+    '███               ███  ███   ███'
+    '███▌    ▄    ▄█   ███  ███   ███'
+    '█████▄▄██  ▄███████▀    ▀█████▀'
+    '▀'
+  )
+  local row on='' off='' width=0
+  local cols="${COLUMNS:-$(tput cols 2>/dev/null || printf '80')}"
+  local art_pad title_pad subtitle_pad
+  [[ $cols =~ ^[1-9][0-9]*$ ]] || cols=80
+  for row in "${rows[@]}"; do
+    if (( ${#row} > width )); then width=${#row}; fi
+  done
+  art_pad=$(( cols > width ? (cols - width) / 2 : 0 ))
+  title_pad=$(( cols > ${#title} ? (cols - ${#title}) / 2 : 0 ))
+  subtitle_pad=$(( cols > ${#subtitle} ? (cols - ${#subtitle}) / 2 : 0 ))
+  if [[ -t 1 && -z ${NO_COLOR:-} && ${TERM:-dumb} != dumb ]]; then
+    on=$'\e[38;2;163;209;109m' off=$'\e[0m'
+  fi
+  printf '\n'
+  for row in "${rows[@]}"; do
+    printf '%*s%s%s%s\n' "$art_pad" '' "$on" "$row" "$off"
+  done
+  printf '\n%*s%s%s%s\n' "$title_pad" '' "$c" "$title" "$r"
+  printf '%*s%s%s%s\n\n' "$subtitle_pad" '' "$d" "$subtitle" "$r"
+}
+
+# Half-block 15x15 Omarchy icon tracer from omarchy-install-dashboard
+ICON_WIDTH=16
+ICON_HEIGHT=8
+ICON_STEPS=0
+declare -a ICON_ORDER=() ICON_TRACE=() ICON_FILL=()
+
+icon_pixel() {
+  local pixel="$1"
+  if [[ -z "${ICON_TRACE[pixel]:-}" ]]; then
+    ICON_ORDER+=("$pixel")
+    ICON_TRACE[pixel]=${#ICON_ORDER[@]}
+  fi
+}
+
+icon_segment() {
+  local x1="$1" y1="$2" x2="$3" y2="$4"
+  local x y from to
+  if (( y1 == y2 )); then
+    from=$(( (x1 * ICON_WIDTH + 14) / 15 ))
+    to=$(( ((x2 + 1) * ICON_WIDTH + 14) / 15 ))
+    if (( x2 < x1 )); then
+      from=$(( ((x1 + 1) * ICON_WIDTH + 14) / 15 - 1 ))
+      to=$(( (x2 * ICON_WIDTH + 14) / 15 - 1 ))
+    fi
+    for ((x=from; x!=to; x+=(x2 >= x1 ? 1 : -1))); do
+      icon_pixel "$((y1 * ICON_WIDTH + x))"
+    done
+  else
+    from=$y1
+    to=$(( y2 + (y2 >= y1 ? 1 : -1) ))
+    for ((y=from; y!=to; y+=(y2 >= y1 ? 1 : -1))); do
+      for ((x=(x1 * ICON_WIDTH + 14) / 15; x<((x1 + 1) * ICON_WIDTH + 14) / 15; x++)); do
+        icon_pixel "$((y * ICON_WIDTH + x))"
+      done
+    done
+  fi
+}
+
+build_omarchy_icon() {
+  local x y row
+  local -a mask=(
+    111111111111111
+    100000010000001
+    101111110001101
+    101000000000101
+    101000000000101
+    101000000000101
+    101000000000101
+    111000000000101
+    101000000000101
+    101000000000101
+    101000000000101
+    101000000000101
+    101111111111101
+    100000010000001
+    111111110111111
+  )
+  ICON_ORDER=() ICON_TRACE=() ICON_FILL=()
+  icon_segment 7 14 0 14
+  icon_segment 0 14 0 0
+  icon_segment 0 0 7 0
+  icon_segment 7 0 7 2
+  icon_segment 7 2 2 2
+  icon_segment 2 2 2 7
+  icon_segment 2 7 0 7
+  icon_segment 2 7 2 12
+  icon_segment 2 12 7 12
+  icon_segment 7 12 7 14
+  icon_segment 7 12 12 12
+  icon_segment 12 12 12 2
+  icon_segment 12 2 11 2
+  icon_segment 7 0 14 0
+  icon_segment 14 0 14 14
+  icon_segment 14 14 9 14
+  ICON_STEPS=${#ICON_ORDER[@]}
+  for ((y=0; y<15; y++)); do
+    row=${mask[y]}
+    for ((x=0; x<ICON_WIDTH; x++)); do
+      ICON_FILL[y * ICON_WIDTH + x]=${row:x * 15 / ICON_WIDTH:1}
+    done
+  done
+}
+
+draw_omarchy_icon_frame() {
+  local pm="$1" status_line="$2" sub_line="$3"
+  local drawn=$(( pm * ICON_STEPS / 1000 ))
+  local solid=$(( pm >= 1000 ? 1 : 0 ))
+  local cols pad row col pixel upper lower step line_buf
+  cols="$(tput cols 2>/dev/null || echo 80)"
+  pad=$(( (cols - ICON_WIDTH) / 2 ))
+  (( pad < 0 )) && pad=0
+  local pad_str
+  pad_str="$(printf '%*s' "$pad" '')"
+
+  for ((row=0; row<ICON_HEIGHT; row++)); do
+    line_buf="\r\033[2K${pad_str}"
+    for ((col=0; col<ICON_WIDTH; col++)); do
+      pixel=$(( row * 2 * ICON_WIDTH + col ))
+      upper=0; lower=0
+      if (( solid )); then
+        (( ${ICON_FILL[pixel]:-0} )) && upper=32
+        (( ${ICON_FILL[pixel + ICON_WIDTH]:-0} )) && lower=32
+      else
+        step=${ICON_TRACE[pixel]:-0}
+        (( step > 0 )) && upper=90
+        (( step > 0 && step <= drawn )) && upper=32
+        step=${ICON_TRACE[pixel + ICON_WIDTH]:-0}
+        (( step > 0 )) && lower=90
+        (( step > 0 && step <= drawn )) && lower=32
+      fi
+      if (( upper == 0 && lower == 0 )); then
+        line_buf+="\033[0m "
+      elif (( upper == lower )); then
+        line_buf+="\033[${upper};49m█"
+      elif (( lower == 0 )); then
+        line_buf+="\033[${upper};49m▀"
+      elif (( upper == 0 )); then
+        line_buf+="\033[${lower};49m▄"
+      else
+        line_buf+="\033[${upper};$((lower + 10))m▀"
+      fi
+    done
+    printf '%b\033[0m\n' "$line_buf"
+  done
+
+  local s_pad=$(( (cols - ${#status_line}) / 2 )); (( s_pad < 0 )) && s_pad=0
+  local m_pad=$(( (cols - ${#sub_line}) / 2 )); (( m_pad < 0 )) && m_pad=0
+  printf '\r\033[2K\n'
+  printf '\r\033[2K%*s\033[32m%s\033[0m\n' "$s_pad" '' "$status_line"
+  printf '\r\033[2K%*s\033[32m%s\033[0m\n' "$m_pad" '' "$sub_line"
+}
+
+ensure_shortcut_inhibit_allowed() {
+  local desktop_file="$HOME/.local/share/applications/virt-viewer.desktop"
+  if [[ ! -f "$desktop_file" ]]; then
+    mkdir -p "$HOME/.local/share/applications"
+    cat <<'EOF' > "$desktop_file"
+[Desktop Entry]
+Name=Virt Viewer
+Exec=virt-viewer %u
+Type=Application
+NoDisplay=true
+StartupWMClass=virt-viewer
+EOF
+    update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
+  fi
+  for app_id in virt-viewer.desktop remote-viewer.desktop org.virt-manager.virt-viewer.desktop; do
+    gdbus call --session \
+      --dest org.freedesktop.impl.portal.PermissionStore \
+      --object-path /org/freedesktop/impl/portal/PermissionStore \
+      --method org.freedesktop.impl.portal.PermissionStore.SetPermission \
+      gnome true shortcuts-inhibitor "$app_id" "['GRANTED']" >/dev/null 2>&1 || true
+  done
+}
+
+open_desktop() {
+  local mode="${1:-window}"
+  # No SSH wait: the display is the recovery path when the guest is not
+  # reachable over SSH (installer screen, OOBE, boot problems).
+  start_vm_if_needed
+  ensure_shortcut_inhibit_allowed
+  if pgrep -f "virt-viewer.*$VM" >/dev/null 2>&1; then
+    if [[ "${2:-}" == "--reattach" || "${2:-}" == "-r" || "$mode" == "--fullscreen" || "$mode" == "-f" ]]; then
+      pkill -f "virt-viewer.*$VM" 2>/dev/null || true
+      sleep 0.2
+    else
+      gdbus call --session --dest org.gnome.Shell --object-path /org/gnome/Shell \
+        --method org.gnome.Shell.Eval \
+        "global.get_window_actors().map(a=>a.meta_window).filter(w=>w.get_title()&&w.get_title().includes('$VM')).forEach(w=>w.activate(global.get_current_time()))" >/dev/null 2>&1 || true
+      echo "Omarchy desktop viewer ($VM) is already running (focused existing window)."
+      return 0
+    fi
+  fi
+  local args=(
+    -c "$URI"
+    --attach
+    --reconnect
+    --auto-resize=always
+    --hotkeys=release-cursor=ctrl+alt
+    --wait
+    "$VM"
+  )
+  local label="window"
+  if [[ "$mode" == "--fullscreen" || "$mode" == "-f" ]]; then
+    args=(--full-screen "${args[@]}")
+    label="fullscreen"
+  fi
+  nohup virt-viewer "${args[@]}" >/dev/null 2>&1 &
+  echo "Attached Omarchy desktop ($VM, ${label}). Super shortcuts pass straight to Hyprland (Ctrl+Alt or Super+Escape releases)."
+}
+
+prompt_install_credentials() {
+  local default_user="${USER:-dhh}"
+  INSTALL_USER="${LSO_INSTALL_USER:-}"
+  INSTALL_PASS="${LSO_INSTALL_PASS:-}"
+
+  while [[ -z "$INSTALL_USER" ]]; do
+    read -r -p "Enter new UNIX username [${default_user}]: " input_user </dev/tty
+    INSTALL_USER="${input_user:-$default_user}"
+    if [[ ! "$INSTALL_USER" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
+      echo "Invalid username '$INSTALL_USER' (use lowercase letters, digits, '_', or '-')." >&2
+      INSTALL_USER=""
+    fi
+  done
+
+  while [[ -z "$INSTALL_PASS" ]]; do
+    local p1="" p2=""
+    read -r -s -p "New password for ${INSTALL_USER}: " p1 </dev/tty
+    echo >&2
+    if [[ -z "$p1" ]]; then
+      echo "Password cannot be empty." >&2
+      continue
+    fi
+    read -r -s -p "Retype new password: " p2 </dev/tty
+    echo >&2
+    if [[ "$p1" != "$p2" ]]; then
+      echo "Sorry, passwords do not match." >&2
+      continue
+    fi
+    INSTALL_PASS="$p1"
+  done
+}
+
+build_cidata_iso() {
+  local target_dir="$1"
+  local disk_gib="$2"
+  local oobe_mode="${3:-false}"
+  local hostname_val="${4:-omarchy}"
+  local uname="${5:-dhh}"
+  local upass="${6:-dhh}"
+  local iso_out="$target_dir/cidata.iso"
+  local tmp
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+
+  local pass_hash
+  pass_hash="$(printf '%s' "$upass" | openssl passwd -6 -stdin)"
+  local tz
+  tz="$(timedatectl show -p Timezone --value 2>/dev/null || echo "UTC")"
+  local git_name git_email
+  git_name="$(git config --global user.name 2>/dev/null || echo "")"
+  git_email="$(git config --global user.email 2>/dev/null || echo "")"
+
+  [[ -f "$KEY" ]] || ssh-keygen -t ed25519 -f "$KEY" -N "" -C "$VM" >/dev/null
+  cat "$KEY.pub" > "$tmp/authorized_keys"
+  [[ -f "$HOME/.ssh/id_ed25519.pub" ]] && cat "$HOME/.ssh/id_ed25519.pub" >> "$tmp/authorized_keys"
+
+  printf '%s\n' "$git_name" > "$tmp/user_full_name.txt"
+  printf '%s\n' "$git_email" > "$tmp/user_email_address.txt"
+  printf 'false\n' > "$tmp/user_encrypt_installation.txt"
+
+  if [[ "$oobe_mode" == "true" ]]; then
+    touch "$tmp/defer-provisioning"
+    cat <<EOF > "$tmp/user_credentials.json"
+{
+    "users": []
+}
+EOF
+  else
+    printf '%s\n' "$uname" > "$target_dir/user"
+    cat <<EOF > "$tmp/user_credentials.json"
+{
+    "root_enc_password": $(printf '%s' "$pass_hash" | jq -Rsa),
+    "users": [
+        {
+            "enc_password": $(printf '%s' "$pass_hash" | jq -Rsa),
+            "groups": [],
+            "sudo": true,
+            "username": $(printf '%s' "$uname" | jq -Rsa)
+        }
+    ]
+}
+EOF
+  fi
+
+  local disk_size=$((disk_gib * 1024 * 1024 * 1024))
+  local mib=$((1024 * 1024))
+  local boot_size=$((2 * 1024 * mib))
+  local main_start=$((boot_size + mib))
+  local main_size=$((disk_size - main_start - mib))
+
+  cat <<EOF > "$tmp/user_configuration.json"
+{
+    "app_config": null,
+    "archinstall-language": "English",
+    "auth_config": {},
+    "audio_config": { "audio": "pipewire" },
+    "bootloader_config": { "bootloader": "Limine", "uki": false, "removable": false },
+    "custom_commands": [],
+    "omarchy_install": {
+        "input_method": "none",
+        "input_xkb_layout": "",
+        "mode": "full_disk",
+        "defer_provisioning": $oobe_mode,
+        "target_mount": "/mnt",
+        "boot": {
+            "esp_mount": "/boot",
+            "esp_path": "/EFI/limine",
+            "efi_binary": "limine_x64.efi",
+            "enable_fallback": true
+        },
+        "storage": {
+            "kernel": "linux-omarchy"
+        }
+    },
+    "disk_config": {
+        "config_type": "default_layout",
+        "device_modifications": [
+            {
+                "device": "/dev/vda",
+                "partitions": [
+                    {
+                        "btrfs": [],
+                        "dev_path": null,
+                        "flags": [ "boot", "esp" ],
+                        "fs_type": "fat32",
+                        "mount_options": [],
+                        "mountpoint": "/boot",
+                        "obj_id": "ea21d3f2-82bb-49cc-ab5d-6f81ae94e18d",
+                        "size": { "sector_size": { "unit": "B", "value": 512 }, "unit": "B", "value": $boot_size },
+                        "start": { "sector_size": { "unit": "B", "value": 512 }, "unit": "B", "value": $mib },
+                        "status": "create",
+                        "type": "primary"
+                    },
+                    {
+                        "btrfs": [
+                            { "mountpoint": "/", "name": "@" },
+                            { "mountpoint": "/home", "name": "@home" },
+                            { "mountpoint": "/var/log", "name": "@log" },
+                            { "mountpoint": "/var/cache/pacman/pkg", "name": "@pkg" }
+                        ],
+                        "dev_path": null,
+                        "flags": [],
+                        "fs_type": "btrfs",
+                        "mount_options": [ "compress=zstd" ],
+                        "mountpoint": null,
+                        "obj_id": "8c2c2b92-1070-455d-b76a-56263bab24aa",
+                        "size": { "sector_size": { "unit": "B", "value": 512 }, "unit": "B", "value": $main_size },
+                        "start": { "sector_size": { "unit": "B", "value": 512 }, "unit": "B", "value": $main_start },
+                        "status": "create",
+                        "type": "primary"
+                    }
+                ],
+                "wipe": true
+            }
+        ]
+    },
+    "hostname": $(printf '%s' "$hostname_val" | jq -Rsa),
+    "kernels": [ "linux-omarchy" ],
+    "network_config": { "type": "iso" },
+    "ntp": true,
+    "parallel_downloads": 8,
+    "script": null,
+    "services": [],
+    "swap": true,
+    "timezone": "$tz",
+    "locale_config": {
+        "kb_layout": "us",
+        "sys_enc": "UTF-8",
+        "sys_lang": "en_US.UTF-8"
+    },
+    "mirror_config": {
+        "custom_repositories": [],
+        "custom_servers": [
+            {"url": "https://mirror.omarchy.org/\$repo/os/\$arch"},
+            {"url": "https://mirror.rackspace.com/archlinux/\$repo/os/\$arch"},
+            {"url": "https://geo.mirror.pkgbuild.com/\$repo/os/\$arch"}
+        ],
+        "mirror_regions": {},
+        "optional_repositories": []
+    },
+    "packages": [
+        "base-devel",
+        "git",
+        "omarchy-keyring",
+        "omarchy-settings",
+        "omarchy"
+    ],
+    "profile_config": {
+        "gfx_driver": null,
+        "greeter": null,
+        "profile": {}
+    },
+    "version": "3.0.9"
+}
+EOF
+
+  xorriso -as mkisofs -V cidata -J -R -o "$iso_out" "$tmp" >/dev/null 2>&1
+  setfacl -m u:libvirt-qemu:r "$iso_out" 2>/dev/null || true
+  echo "$iso_out"
+}
+
+# Reuse the UUID of the existing libvirt domain (or of the instance's domain.xml)
+# so redefining lso-<name> updates it in place; otherwise generate a new one.
+resolve_domain_uuid() {
+  local target_dir="$1"
+  local vm_name="$2"
+  local uuid=""
+  uuid="$(virsh -c "$URI" domuuid "$vm_name" 2>/dev/null | tr -d '[:space:]')" || true
+  if [[ -z "$uuid" && -f "$target_dir/domain.xml" ]]; then
+    uuid="$(sed -n "s|.*<uuid>\([0-9a-fA-F-]\{36\}\)</uuid>.*|\1|p" "$target_dir/domain.xml" | head -n 1)"
+  fi
+  if [[ -z "$uuid" ]]; then
+    uuid="$(cat /proc/sys/kernel/random/uuid)"
+  fi
+  printf '%s\n' "$uuid"
+}
+
+# Best-effort read of the tail of a guest file via the QEMU guest agent (live ISO).
+qga_tail_file() {
+  local vm="$1" path="$2" out pid res
+  out="$(virsh -c "$URI" qemu-agent-command "$vm" --timeout 3 "{\"execute\":\"guest-exec\",\"arguments\":{\"path\":\"/usr/bin/tail\",\"arg\":[\"-c\",\"65536\",\"$path\"],\"capture-output\":true}}" 2>/dev/null)" || return 1
+  pid="$(jq -r '.return.pid // empty' <<<"$out")" || return 1
+  [[ -n "$pid" ]] || return 1
+  sleep 0.3
+  res="$(virsh -c "$URI" qemu-agent-command "$vm" --timeout 3 "{\"execute\":\"guest-exec-status\",\"arguments\":{\"pid\":$pid}}" 2>/dev/null)" || return 1
+  [[ "$(jq -r '.return.exited // false' <<<"$res")" == "true" && "$(jq -r '.return.exitcode // 1' <<<"$res")" == "0" ]] || return 1
+  jq -r '.return["out-data"] // empty' <<<"$res" | base64 -d
+}
+
+write_domain_xml() {
+  local target_dir="$1"
+  local vm_name="$2"
+  local cpus="$3"
+  local ram_mib="$4"
+  local iso_path="${5:-}"
+  local cidata_iso="${6:-}"
+  local domain_uuid
+  domain_uuid="$(resolve_domain_uuid "$target_dir" "$vm_name")"
+  local cores=$(( cpus >= 2 ? cpus / 2 : 1 ))
+  local threads=$(( cpus >= 2 ? 2 : 1 ))
+  local render_node
+  render_node="$(ls /dev/dri/by-path/*-render 2>/dev/null | head -n 1 || echo "/dev/dri/renderD128")"
+
+  local cdrom_xml=""
+  if [[ -n "$iso_path" && -n "$cidata_iso" ]]; then
+    cdrom_xml="
+    <disk type='file' device='cdrom'>
+      <driver name='qemu' type='raw'/>
+      <source file='${iso_path}'/>
+      <target dev='sda' bus='sata'/>
+      <readonly/>
+      <boot order='2'/>
+    </disk>
+    <disk type='file' device='cdrom'>
+      <driver name='qemu' type='raw'/>
+      <source file='${cidata_iso}'/>
+      <target dev='sdb' bus='sata'/>
+      <readonly/>
+    </disk>"
+  else
+    cdrom_xml="
+    <disk type='file' device='cdrom'>
+      <driver name='qemu' type='raw'/>
+      <target dev='sda' bus='sata'/>
+      <readonly/>
+    </disk>"
+  fi
+
+  cat <<EOF > "$target_dir/domain.xml"
+<domain type='kvm'>
+  <name>${vm_name}</name>
+  <uuid>${domain_uuid}</uuid>
+  <metadata>
+    <libosinfo:libosinfo xmlns:libosinfo="http://libosinfo.org/xmlns/libvirt/domain/1.0">
+      <libosinfo:os id="http://archlinux.org/archlinux/rolling"/>
+    </libosinfo:libosinfo>
+  </metadata>
+  <memory unit='MiB'>${ram_mib}</memory>
+  <currentMemory unit='MiB'>${ram_mib}</currentMemory>
+  <vcpu placement='static'>${cpus}</vcpu>
+  <iothreads>1</iothreads>
+  <os firmware='efi'>
+    <type arch='x86_64' machine='pc-q35-noble'>hvm</type>
+    <firmware>
+      <feature enabled='no' name='enrolled-keys'/>
+      <feature enabled='no' name='secure-boot'/>
+    </firmware>
+    <loader readonly='yes' type='pflash'>/usr/share/OVMF/OVMF_CODE_4M.fd</loader>
+    <nvram template='/usr/share/OVMF/OVMF_VARS_4M.fd'>${target_dir}/OVMF_VARS.fd</nvram>
+  </os>
+  <features>
+    <acpi/>
+    <apic/>
+    <vmport state='off'/>
+  </features>
+  <cpu mode='host-passthrough' check='none' migratable='off'>
+    <topology sockets='1' dies='1' clusters='1' cores='${cores}' threads='${threads}'/>
+    <cache mode='passthrough'/>
+  </cpu>
+  <clock offset='utc'>
+    <timer name='rtc' tickpolicy='catchup'/>
+    <timer name='pit' tickpolicy='delay'/>
+    <timer name='hpet' present='no'/>
+  </clock>
+  <on_poweroff>destroy</on_poweroff>
+  <on_reboot>restart</on_reboot>
+  <on_crash>destroy</on_crash>
+  <pm>
+    <suspend-to-mem enabled='no'/>
+    <suspend-to-disk enabled='no'/>
+  </pm>
+  <devices>
+    <emulator>/usr/bin/qemu-system-x86_64</emulator>
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='raw' cache='none' io='io_uring' discard='unmap' iothread='1' queues='${cpus}'/>
+      <source file='${target_dir}/disk.raw'/>
+      <target dev='vda' bus='virtio'/>
+      <boot order='1'/>
+    </disk>${cdrom_xml}
+    <controller type='usb' index='0' model='qemu-xhci' ports='15'/>
+    <controller type='sata' index='0'/>
+    <controller type='virtio-serial' index='0'/>
+    <interface type='network'>
+      <source network='default'/>
+      <model type='virtio'/>
+      <driver name='vhost' queues='${cpus}'/>
+    </interface>
+    <serial type='pty'>
+      <target type='isa-serial' port='0'>
+        <model name='isa-serial'/>
+      </target>
+    </serial>
+    <console type='pty'>
+      <target type='serial' port='0'/>
+    </console>
+    <channel type='spicevmc'>
+      <target type='virtio' name='com.redhat.spice.0'/>
+    </channel>
+    <channel type='unix'>
+      <target type='virtio' name='org.qemu.guest_agent.0'/>
+    </channel>
+    <input type='tablet' bus='usb'/>
+    <input type='mouse' bus='virtio'/>
+    <input type='keyboard' bus='virtio'/>
+    <input type='mouse' bus='ps2'/>
+    <input type='keyboard' bus='ps2'/>
+    <tpm model='tpm-crb'>
+      <backend type='emulator' version='2.0'/>
+    </tpm>
+    <graphics type='spice'>
+      <listen type='none'/>
+      <image compression='off'/>
+      <gl enable='yes' rendernode='${render_node}'/>
+    </graphics>
+    <sound model='ich9'/>
+    <audio id='1' type='spice'/>
+    <video>
+      <model type='virtio' heads='1' primary='yes'>
+        <acceleration accel3d='yes'/>
+      </model>
+    </video>
+    <watchdog model='itco' action='reset'/>
+    <memballoon model='virtio'/>
+    <rng model='virtio'>
+      <backend model='random'>/dev/urandom</backend>
+    </rng>
+  </devices>
+</domain>
+EOF
+}
+
+list_instances() {
+  local active_vm=""
+  resolve_instance "$TARGET_NAME"
+  active_vm="$VM"
+
+  printf "  %-16s %-16s %-12s %-16s %-16s %s\n" "NAME" "VM DOMAIN" "STATE" "IP" "RESOURCES" "PATH"
+  printf "  %-16s %-16s %-12s %-16s %-16s %s\n" "----" "---------" "-----" "--" "---------" "----"
+
+  print_row() {
+    local inst_name="$1"
+    local dom_name="$2"
+    local dir_path="$3"
+    local state ip vcpus max_mem_kib mem_gib res mark=" "
+    [[ "$dom_name" == "$active_vm" ]] && mark="*"
+    state="$(virsh -c "$URI" domstate "$dom_name" 2>/dev/null | head -n 1 || echo "undefined")"
+    [[ -z "$state" ]] && state="undefined"
+    ip="$(get_vm_ip "$dom_name" || true)"
+    vcpus="$(virsh -c "$URI" dominfo "$dom_name" 2>/dev/null | awk -F: '/^CPU\(s\)/ {gsub(/^[ \t]+/, "", $2); print $2}')"
+    max_mem_kib="$(virsh -c "$URI" dominfo "$dom_name" 2>/dev/null | awk '/^Max memory:/ {print $3}')"
+    mem_gib="$(awk -v k="${max_mem_kib:-0}" 'BEGIN {printf "%.0fG", k/1048576}')"
+    res="${vcpus:-?}c / ${mem_gib}"
+    printf "%s %-16s %-16s %-12s %-16s %-16s %s\n" "$mark" "$inst_name" "$dom_name" "$state" "${ip:--}" "$res" "$dir_path"
+  }
+
+  # 1. Explicit legacy omarchy-vm (only when LSO_LEGACY_HOME is set)
+  if [[ -n "$LSO_LEGACY_HOME" && -f "$LSO_LEGACY_HOME/omarchy-vm.xml" ]]; then
+    print_row "omarchy-vm" "omarchy-vm" "$LSO_LEGACY_HOME"
+  fi
+
+  # 2. Direct ~/.lso/domain.xml
+  if [[ -f "$LSO_BASE_DIR/domain.xml" ]]; then
+    print_row "default" "lso-vm" "$LSO_BASE_DIR"
+  fi
+
+  # 3. Named instances under ~/.lso/<name>/domain.xml
+  local xml
+  for xml in "$LSO_BASE_DIR"/*/domain.xml; do
+    [[ -f "$xml" ]] || continue
+    local dir inst dom
+    dir="$(dirname "$xml")"
+    inst="$(basename "$dir")"
+    dom="$(sed -n 's|.*<name>\(.*\)</name>.*|\1|p' "$xml" | head -n 1)"
+    [[ -z "$dom" ]] && dom="lso-$inst"
+    print_row "$inst" "$dom" "$dir"
+  done
+}
+
+resolve_instance "$TARGET_NAME"
+refresh_instance_env() {
+  KEY="$LSO_DIR/id_ed25519"
+  if [[ -n "${LSO_USER:-}" ]]; then
+    GUEST_USER="$LSO_USER"
+  elif [[ -f "$LSO_DIR/user" ]]; then
+    GUEST_USER="$(<"$LSO_DIR/user")"
+  else
+    GUEST_USER="dhh"
+  fi
+  SSH_OPTS=(
+    -i "$KEY"
+    -o StrictHostKeyChecking=accept-new
+    -o UserKnownHostsFile="$LSO_DIR/known_hosts"
+    -o BatchMode=yes
+    -o LogLevel=QUIET
+  )
+}
+refresh_instance_env
+
+set_default_instance() {
+  local target="${1:-}"
+  if [[ -z "$target" ]]; then
+    echo "Usage: lso --set-default-to <vm-name>" >&2
+    exit 1
+  fi
+  target="${target#lso-}"
+  if [[ "$target" == "omarchy-vm" && -n "$LSO_LEGACY_HOME" && -f "$LSO_LEGACY_HOME/omarchy-vm.xml" ]]; then
+    rm -f "$LSO_BASE_DIR/current"
+    echo "Default instance set to omarchy-vm ($LSO_LEGACY_HOME)."
+  elif [[ -f "$LSO_BASE_DIR/$target/domain.xml" ]]; then
+    mkdir -p "$LSO_BASE_DIR"
+    printf '%s\n' "$target" > "$LSO_BASE_DIR/current"
+    echo "Default instance set to $target ($LSO_BASE_DIR/$target)."
+  else
+    echo "ERROR: Instance '$target' not found. Run 'lso list' to see installed instances." >&2
+    exit 1
+  fi
+}
+
+show_env() {
+  local d xml iso vars
+  d="$(realpath -m -- "$LSO_DIR")"; xml="$(realpath -m -- "$XML_FILE")"
+  _env_row() {
+    local label="$1" p="$2" note=""
+    [[ -e "$p" ]] || note="  (missing/not created)"
+    printf '  %-16s %s%s\n' "$label" "$p" "$note"
+  }
+  vars="$d/OVMF_VARS.fd"
+  iso=""
+  if [[ -f "$xml" ]]; then
+    vars="$(sed -n "s|.*<nvram[^>]*>\([^<]*\)</nvram>.*|\1|p" "$xml" | head -n 1)"; vars="${vars:-$d/OVMF_VARS.fd}"
+    iso="$(sed -n "s|.*<source file='\([^']*\.iso\)'.*|\1|p" "$xml" | grep -v '/cidata\.iso$' | head -n 1 || true)"
+  fi
+  echo "Context"
+  printf '  %-16s %s\n' "VM" "$VM" "User" "$GUEST_USER" "Libvirt URI" "$URI"
+  echo "State"
+  printf '  %-16s %s\n' "Base dir" "$(realpath -m -- "$LSO_BASE_DIR")"
+  _env_row "Default pointer" "$(realpath -m -- "$LSO_BASE_DIR")/current"
+  _env_row "Instance dir" "$d"
+  echo "VM files"
+  _env_row "Domain XML" "$xml"
+  _env_row "Disk" "$(realpath -m -- "$DISK_FILE")"
+  _env_row "OVMF VARS" "$vars"
+  _env_row "cidata ISO" "$d/cidata.iso"
+  [[ -z "$iso" ]] || _env_row "Installer ISO" "$iso"
+  echo "Access (paths only)"
+  _env_row "SSH private key" "$d/id_ed25519"
+  _env_row "SSH public key" "$d/id_ed25519.pub"
+  _env_row "known_hosts" "$d/known_hosts"
+  _env_row "Saved user" "$d/user"
+  echo "Logs/state"
+  _env_row "Install state" "$d/install-state.json"
+  _env_row "Install timing" "$d/install-timing.json"
+  _env_row "Bootstrap log" "$d/bootstrap.log"
+  _env_row "Install log" "$d/install.log"
+}
+
+cmd="${1:-shell}"
+
+# Accept -n/--name <name> after the subcommand too (e.g. `lso stop -n foo`)
+case "$cmd" in
+  shell|sh|desktop|gui|attach|app|apps|status|st|ip|stop|shutdown|down|kill|reboot|restart|env)
+    if (( $# > 0 )); then shift; fi
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        -n|--name)
+          [[ $# -ge 2 ]] || { echo "ERROR: $1 requires a value" >&2; exit 1; }
+          resolve_instance "$2"; refresh_instance_env; shift 2 ;;
+        --name=*)
+          resolve_instance "${1#*=}"; refresh_instance_env; shift ;;
+        *) break ;;
+      esac
+    done
+    set -- "$cmd" "$@"
+    ;;
+esac
+
+case "$cmd" in
+  env)
+    show_env
+    ;;
+  list|ls)
+    list_instances
+    ;;
+  --set-default-to|use|switch)
+    shift
+    set_default_instance "${1:-}"
+    ;;
+  --set-default-to=*)
+    set_default_instance "${cmd#*=}"
+    ;;
+  shell|sh)
+    ip="$(ensure_running)"
+    shift $(( $# >= 1 ? 1 : 0 ))
+    if [[ $# -eq 0 ]]; then
+      exec ssh "${SSH_OPTS[@]}" "${GUEST_USER}@${ip}"
+    else
+      exec ssh -t "${SSH_OPTS[@]}" "${GUEST_USER}@${ip}" "bash -lc $(printf '%q' "$(printf '%q ' "$@")")"
+    fi
+    ;;
+  desktop|gui|attach)
+    shift
+    case "${1:-}" in
+      --launch|-l)
+        shift
+        ip="$(ensure_running)"
+        if [[ $# -eq 0 ]]; then
+          exec ssh "${SSH_OPTS[@]}" "${GUEST_USER}@${ip}" "source /etc/profile; omarchy launch --help"
+        fi
+        open_desktop "window"
+        exec ssh "${SSH_OPTS[@]}" "${GUEST_USER}@${ip}" bash -l -s -- "$@" <<'REMOTE_EOF'
+          while IFS= read -r -d '' kv; do
+            export "$kv" 2>/dev/null || true
+          done < <(systemctl --user show-environment -z)
+          if [[ -x "/usr/bin/omarchy-launch-$1" ]]; then
+            cmd="/usr/bin/omarchy-launch-$1"
+            shift
+            nohup "$cmd" "$@" >/dev/null 2>&1 &
+          else
+            nohup omarchy-launch-or-focus "$1" "uwsm-app -- $*" >/dev/null 2>&1 &
+          fi
+REMOTE_EOF
+        ;;
+      --fullscreen|-f)
+        open_desktop "--fullscreen" "${2:-}"
+        ;;
+      *)
+        open_desktop "window" "${1:-}"
+        ;;
+    esac
+    ;;
+  app|apps)
+    shift
+    if [[ $# -eq 0 || "${1:-}" == "list" || "${1:-}" == "--list" || "${1:-}" == "-l" ]]; then
+      ip="$(ensure_running)"
+      echo "Available GUI apps in Omarchy ($VM, run with: lso app <command>):"
+      printf "  %-24s %s\n" "COMMAND" "NAME"
+      printf "  %-24s %s\n" "-------" "----"
+      exec ssh "${SSH_OPTS[@]}" "${GUEST_USER}@${ip}" '
+        for f in /usr/share/applications/*.desktop ~/.local/share/applications/*.desktop; do
+          [ -f "$f" ] || continue
+          grep -qi "^NoDisplay=true" "$f" && continue
+          grep -qi "^Terminal=true" "$f" && continue
+          name=$(sed -n "s/^Name=//p" "$f" | head -n 1)
+          bin=$(sed -n "s/^Exec=//p" "$f" | head -n 1 | awk "{print \$1}" | tr -d "\"")
+          bin="${bin##*/}"
+          case "$bin" in
+            omarchy-*|xdg-*|avahi-*|bssh|bvnc|qv4l2|qvidcap|uuctl|kbd-*|fcitx5-migrator) continue ;;
+          esac
+          printf "  %-24s %s\n" "$bin" "$name"
+        done | sort -u -k1,1
+      '
+    fi
+    ip="$(ensure_running)"
+    if ! command -v waypipe >/dev/null 2>&1; then
+      echo "ERROR: host waypipe is not installed; cannot stream apps." >&2
+      exit 1
+    fi
+    if ! timeout 15 ssh "${SSH_OPTS[@]}" "${GUEST_USER}@${ip}" 'command -v waypipe >/dev/null 2>&1'; then
+      echo "ERROR: waypipe is not installed in guest '$VM'; 'lso app' cannot stream." >&2
+      echo "Run 'omarchy update -y' in the guest, then 'omarchy pkg add qemu-guest-agent spice-vdagent waypipe'." >&2
+      exit 1
+    fi
+    nohup waypipe --no-gpu ssh "${SSH_OPTS[@]}" "${GUEST_USER}@${ip}" \
+      env \
+      LANG=en_US.UTF-8 \
+      LC_ALL=en_US.UTF-8 \
+      PATH="/usr/share/omarchy/bin:/home/${GUEST_USER}/.local/share/mise/shims:/home/${GUEST_USER}/.local/bin:/usr/local/bin:/usr/bin" \
+      XDG_RUNTIME_DIR=/run/user/1000 \
+      DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus \
+      MOZ_ENABLE_WAYLAND=1 \
+      GDK_BACKEND=wayland \
+      QT_QPA_PLATFORM=wayland \
+      QT_QPA_PLATFORMTHEME=gtk3 \
+      ELECTRON_OZONE_PLATFORM_HINT=wayland \
+      OZONE_PLATFORM=wayland \
+      INPUT_METHOD=fcitx \
+      QT_IM_MODULE=fcitx \
+      XMODIFIERS=@im=fcitx \
+      "$@" >/dev/null 2>&1 &
+    echo "Streaming '$*' window from $VM onto host desktop via waypipe."
+    ;;
+  status|st)
+    shift
+    state="$(virsh -c "$URI" domstate "$VM" 2>/dev/null || echo "undefined")"
+    ip="$(get_ip || true)"
+    vcpus="$(virsh -c "$URI" dominfo "$VM" 2>/dev/null | awk -F: '/^CPU\(s\)/ {gsub(/^[ \t]+/, "", $2); print $2}')"
+    max_mem_kib="$(virsh -c "$URI" dominfo "$VM" 2>/dev/null | awk '/^Max memory:/ {print $3}')"
+    mem_gib="$(awk -v k="${max_mem_kib:-0}" 'BEGIN {printf "%.1f GiB", k/1048576}')"
+    echo "VM:      $VM ($state)"
+    echo "Home:    $LSO_DIR"
+    echo "IP:      ${ip:-none}"
+    if [[ "$state" == "running" && -n "$ip" ]]; then
+      ssh "${SSH_OPTS[@]}" "${GUEST_USER}@${ip}" bash -s <<'REMOTE_STATUS' 2>/dev/null || true
+        read -r _ u1 n1 s1 i1 w1 q1 sq1 st1 _ < /proc/stat
+        sleep 0.2
+        read -r _ u2 n2 s2 i2 w2 q2 sq2 st2 _ < /proc/stat
+        t1=$((u1+n1+s1+i1+w1+q1+sq1+st1))
+        t2=$((u2+n2+s2+i2+w2+q2+sq2+st2))
+        id1=$((i1+w1))
+        id2=$((i2+w2))
+        cpu_pct="$(awk -v dt="$((t2-t1))" -v di="$((id2-id1))" 'BEGIN {if (dt>0) printf "%.1f%%", (dt-di)*100/dt; else print "0.0%"}')"
+        cores="$(nproc)"
+
+        mem_line="$(free -m | awk '/^Mem:/ {printf "%.1f GiB / %.1f GiB (%.1f%%)", $3/1024, $2/1024, $3*100/$2}')"
+        disk_line="$(df -h / | awk 'NR==2 {printf "%s / %s (%s)", $3, $2, $5}')"
+        printf "CPU:     %s vCPUs (%s used)\n" "$cores" "$cpu_pct"
+        printf "Memory:  %s\n" "$mem_line"
+        printf "Disk:    %s\n" "$disk_line"
+        printf "Uptime:  %s\n" "$(uptime -p)"
+        printf "Kernel:  %s\n" "$(uname -r)"
+REMOTE_STATUS
+    else
+      echo "CPU:     ${vcpus:-4} vCPUs"
+      echo "Memory:  ${mem_gib}"
+    fi
+    ;;
+  ip)
+    get_ip
+    ;;
+  stop|shutdown|down)
+    virsh -c "$URI" shutdown "$VM"
+    ;;
+  kill)
+    virsh -c "$URI" destroy "$VM"
+    ;;
+  reboot|restart)
+    ip="$(ensure_running)"
+    ssh "${SSH_OPTS[@]}" "${GUEST_USER}@${ip}" "sudo reboot" || true
+    ;;
+  remove|rm|uninstall|delete)
+    shift
+    rm_force=false
+    rm_name="${TARGET_NAME:-}"
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --name|-n)   rm_name="$2"; shift 2 ;;
+        --name=*)    rm_name="${1#*=}"; shift ;;
+        --force|-f|-y|--yes) rm_force=true; shift ;;
+        *)           rm_name="$1"; shift ;;
+      esac
+    done
+
+    if [[ -z "$rm_name" ]]; then
+      echo "Usage: lso remove [--force] <name>" >&2
+      echo "Run 'lso list' to see installed instances." >&2
+      exit 1
+    fi
+
+    rm_name="${rm_name#lso-}"
+    if [[ "$rm_name" == "omarchy-vm" ]]; then
+      echo "ERROR: Refusing to auto-delete the base workspace VM 'omarchy-vm'${LSO_LEGACY_HOME:+ ($LSO_LEGACY_HOME)}." >&2
+      exit 1
+    fi
+
+    target_dir="$LSO_BASE_DIR/$rm_name"
+    vm_name="lso-$rm_name"
+
+    if [[ ! -d "$target_dir" ]] && ! virsh -c "$URI" dominfo "$vm_name" >/dev/null 2>&1; then
+      echo "ERROR: Instance '$rm_name' ($vm_name) not found." >&2
+      exit 1
+    fi
+
+    if [[ "$rm_force" != "true" ]]; then
+      read -r -p "Remove VM '$vm_name' and all data in '$target_dir'? [y/N]: " ans </dev/tty
+      if [[ ! "$ans" =~ ^[Yy]$ ]]; then
+        echo "Aborted."
+        exit 0
+      fi
+    fi
+
+    pkill -f "virt-viewer.*$vm_name" 2>/dev/null || true
+    virsh -c "$URI" destroy "$vm_name" >/dev/null 2>&1 || true
+    virsh -c "$URI" undefine "$vm_name" --nvram --managed-save --snapshots-metadata >/dev/null 2>&1 \
+      || virsh -c "$URI" undefine "$vm_name" >/dev/null 2>&1 || true
+    rm -rf "$target_dir"
+
+    if [[ -f "$LSO_BASE_DIR/current" && "$(<"$LSO_BASE_DIR/current")" == "$rm_name" ]]; then
+      rm -f "$LSO_BASE_DIR/current"
+    fi
+
+    echo "Removed instance '$rm_name' (domain: $vm_name, path: $target_dir)."
+    ;;
+  install)
+    shift
+    force=false
+    oobe=false
+    with_head=false
+    inst_name="${TARGET_NAME:-default}"
+    resource_preset="default"
+    custom_cpus=""
+    custom_ram_mib=""
+    custom_disk_gib=""
+    iso_path="$(default_iso_cache_path)"
+    iso_explicit=false
+    check_only=false
+
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --name|-n)      inst_name="$2"; shift 2 ;;
+        --name=*)       inst_name="${1#*=}"; shift ;;
+        --resource|-r)  resource_preset="$2"; shift 2 ;;
+        --resource=*)   resource_preset="${1#*=}"; shift ;;
+        --cpus|-c)      custom_cpus="$2"; shift 2 ;;
+        --memory|-m)    custom_ram_mib="$2"; shift 2 ;;
+        --disk|-d)      custom_disk_gib="$2"; shift 2 ;;
+        --user|-u)      export LSO_INSTALL_USER="$2"; shift 2 ;;
+        --password|-p)  export LSO_INSTALL_PASS="$2"; shift 2 ;;
+        --force|-f)     force=true; shift ;;
+        --oobe)         oobe=true; shift ;;
+        --with-head)    with_head=true; shift ;;
+        --iso)          iso_path="$(readlink -f "$2")"; iso_explicit=true; shift 2 ;;
+        --check)        check_only=true; shift ;;
+        *)              iso_path="$(readlink -f "$1")"; iso_explicit=true; shift ;;
+      esac
+    done
+
+    apply_resource_preset "$resource_preset"
+    [[ -n "$custom_cpus" ]] && INSTALL_CPUS="$custom_cpus"
+    [[ -n "$custom_ram_mib" ]] && INSTALL_RAM_MIB="$custom_ram_mib"
+    [[ -n "$custom_disk_gib" ]] && INSTALL_DISK_GIB="$custom_disk_gib"
+
+    # Precedence: (1) usable explicit ISO, (2) cached default ISO, (3) download into the cache.
+    iso_mode=default-iso
+    if [[ "$iso_explicit" == "true" && -f "$iso_path" && -s "$iso_path" ]]; then
+      iso_mode=explicit-iso
+    fi
+    check_host_requirements "$iso_mode"
+    [[ "$check_only" != "true" ]] || exit 0
+
+
+    if [[ ! "$inst_name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ || "$inst_name" == *..* ]]; then
+      echo "ERROR: Invalid instance name '$inst_name' (use letters, digits, '.', '_', '-'; no '/' or '..')." >&2
+      exit 1
+    fi
+
+    target_dir="$LSO_BASE_DIR/$inst_name"
+    vm_name="lso-$inst_name"
+    KEY="$target_dir/id_ed25519"
+    VM="$vm_name"
+
+    if [[ "$force" != "true" && -f "$target_dir/disk.raw" ]]; then
+      echo "Existing installation '$inst_name' found at $target_dir/disk.raw ($vm_name)."
+      echo "Run 'lso install --name $inst_name --force' to wipe and reinstall."
+      exit 0
+    fi
+
+    if virsh -c "$URI" dominfo "$vm_name" >/dev/null 2>&1; then
+      existing_disk="$(virsh -c "$URI" domblklist "$vm_name" --details 2>/dev/null | awk '$2=="disk" {print $4; exit}')"
+      if [[ "$existing_disk" != "$target_dir/disk.raw" ]]; then
+        echo "ERROR: Domain '$vm_name' already exists but its disk ('${existing_disk:-none}') is not '$target_dir/disk.raw'." >&2
+        echo "Refusing to overwrite it. Remove or rename the conflicting domain first." >&2
+        exit 1
+      fi
+    fi
+
+    if [[ "$iso_mode" == "default-iso" ]]; then
+      if [[ "$iso_explicit" == "true" ]]; then
+        echo "WARNING: Supplied ISO '$iso_path' is missing or empty; falling back to the default cached/downloaded ISO." >&2
+      fi
+      iso_path="$(default_iso_cache_path)"
+      ensure_default_iso
+    fi
+
+    if [[ "$oobe" != "true" ]]; then
+      print_lso_banner
+      prompt_install_credentials
+    else
+      print_lso_banner
+    fi
+
+    echo "==> Installing Omarchy instance '$inst_name' (domain: $vm_name)"
+    echo "    Path:      $target_dir"
+    echo "    Preset:    $resource_preset (${INSTALL_CPUS} vCPUs, ${INSTALL_RAM_MIB} MiB RAM, ${INSTALL_DISK_GIB} GiB disk)"
+    echo "    Mode:      $([[ "$oobe" == "true" ]] && echo "OOBE (deferred first-boot setup)" || echo "Headless autoinstall (user: $INSTALL_USER)")"
+
+    ensure_dir_acls "$target_dir"
+    ensure_dir_acls "$(dirname "$iso_path")"
+    setfacl -m u:libvirt-qemu:r "$iso_path" 2>/dev/null || true
+
+    cidata_iso="$(build_cidata_iso "$target_dir" "$INSTALL_DISK_GIB" "$oobe" "$inst_name" "${INSTALL_USER:-}" "${INSTALL_PASS:-}")"
+
+    if virsh -c "$URI" dominfo "$vm_name" >/dev/null 2>&1; then
+      dom_state="$(virsh -c "$URI" domstate "$vm_name" 2>/dev/null | head -n 1)"
+      if [[ "$dom_state" != "shut off" ]]; then
+        if ! virsh -c "$URI" destroy "$vm_name" >/dev/null; then
+          echo "ERROR: Failed to stop '$vm_name'; not touching its disk or NVRAM." >&2
+          exit 1
+        fi
+        dom_state="$(virsh -c "$URI" domstate "$vm_name" 2>/dev/null | head -n 1)"
+        if [[ "$dom_state" != "shut off" ]]; then
+          echo "ERROR: '$vm_name' is still '$dom_state'; not touching its disk or NVRAM." >&2
+          exit 1
+        fi
+      fi
+    fi
+    rm -f "$target_dir/disk.raw"
+    truncate -s "${INSTALL_DISK_GIB}G" "$target_dir/disk.raw"
+    cp /usr/share/OVMF/OVMF_VARS_4M.fd "$target_dir/OVMF_VARS.fd"
+    setfacl -m u:libvirt-qemu:rw "$target_dir/disk.raw" "$target_dir/OVMF_VARS.fd"
+
+    write_domain_xml "$target_dir" "$vm_name" "$INSTALL_CPUS" "$INSTALL_RAM_MIB" "$iso_path" "$cidata_iso"
+    setfacl -m u:libvirt-qemu:r "$target_dir/domain.xml" 2>/dev/null || true
+
+    virsh -c "$URI" define "$target_dir/domain.xml" >/dev/null
+    virsh -c "$URI" start "$vm_name" >/dev/null
+
+    if [[ "$with_head" == "true" ]]; then
+      open_desktop "window"
+    fi
+
+    if [[ "$oobe" == "true" ]]; then
+      echo "==> Waiting for base image installation to complete before OOBE first boot..."
+      echo "    (Run 'lso -n $inst_name desktop' when ready to complete OOBE)"
+      exit 0
+    fi
+
+    echo ""
+    build_omarchy_icon
+    # A reinstall must not inherit host keys from a previous system at this IP.
+    rm -f "$target_dir/known_hosts"
+    # Readiness probes talk to the live ISO first and the installed system later; they
+    # run only a read-only test, so they neither read nor pin host keys. The first
+    # real connection after install pins the installed system's key (accept-new).
+    SSH_OPTS=(-i "$KEY" -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$target_dir/known_hosts" -o BatchMode=yes -o LogLevel=QUIET)
+    PROBE_OPTS=(-i "$KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o LogLevel=ERROR -o ConnectTimeout=2)
+    install_timeout="${LSO_INSTALL_TIMEOUT:-900}"
+    t0=$(date +%s)
+    ip=""
+    ready=false
+    probe_err=""
+    if [[ -t 1 ]]; then
+      printf '\033[?25l'
+      trap 'printf "\033[?25h"' EXIT
+    fi
+    elapsed=0
+    last_poll=-5
+    last_state=""
+    fail_detail=""
+    while (( elapsed < install_timeout )); do
+      elapsed=$(( $(date +%s) - t0 ))
+      ip="$(get_vm_ip "$vm_name" || true)"
+      if [[ -n "$ip" ]]; then
+        if probe_err="$(ssh "${PROBE_OPTS[@]}" "${INSTALL_USER}@${ip}" "test ! -d /run/archiso && test -d /home/${INSTALL_USER}" </dev/null 2>&1 >/dev/null)"; then
+          ready=true
+          break
+        fi
+        phase="guest at $ip, installed system not reachable yet"
+      else
+        phase="waiting for guest network"
+      fi
+      if (( elapsed - last_poll >= 5 )); then
+        last_poll=$elapsed
+        if st="$(qga_tail_file "$vm_name" /run/omarchy-install/state.json)" && jq -e . >/dev/null 2>&1 <<<"$st"; then
+          printf '%s\n' "$st" > "$target_dir/install-state.json"
+          last_state="$st"
+          phase="installer: $(jq -r '.current_phase // "running"' <<<"$st" 2>/dev/null)"
+          if jq -e 'any(.phases[]?; .status == "failed")' >/dev/null 2>&1 <<<"$st"; then
+            fail_detail="$(jq -r '[.phases[]? | select(.status == "failed") | "\(.name): \(.error // "no error recorded")"] | join("; ")' <<<"$st" 2>/dev/null)"
+            [[ -t 1 ]] && printf '\033[?25h'
+            qga_tail_file "$vm_name" /var/log/omarchy-install.log > "$target_dir/install.log" 2>/dev/null || true
+            echo "" >&2
+            echo "ERROR: Omarchy installer reported failure (${fail_detail}). State: $target_dir/install-state.json" >&2
+            tail -n 40 "$target_dir/install.log" >&2 2>/dev/null || true
+            exit 1
+          fi
+        fi
+      fi
+      disk_used="$(du -sh "$target_dir/disk.raw" 2>/dev/null | awk '{print $1}' || true)"
+      # No installer telemetry is exposed to the host, so show activity only (no percentage).
+      pm=$(( (elapsed * 50) % 1000 ))
+      whimsy="${OMARCHY_WHIMSY[$(( (elapsed / 4) % ${#OMARCHY_WHIMSY[@]} ))]}"
+      if [[ -t 1 ]]; then
+        (( elapsed > 0 )) && printf '\033[%dA' "$((ICON_HEIGHT + 3))"
+        draw_omarchy_icon_frame "$pm" "Installing • ${elapsed}s • ${disk_used:-0} on disk • ${phase}" "$whimsy"
+      else
+        printf "\r    [%3ds] installing — %s (disk allocated: %s)   " "$elapsed" "$phase" "${disk_used:-0}"
+      fi
+      sleep 1
+    done
+
+    if [[ "$ready" == "true" ]]; then
+      # Persist official phase timings from the last valid installer state (best-effort refresh first).
+      if st="$(qga_tail_file "$vm_name" /run/omarchy-install/state.json 2>/dev/null)" && jq -e . >/dev/null 2>&1 <<<"$st"; then
+        last_state="$st"
+      fi
+      if [[ -n "${last_state:-}" ]]; then
+        printf '%s\n' "$last_state" > "$target_dir/install-state.json"
+        jq '{started_at, finished_at, target, total_phases, current_index, current_phase,
+             status: (if any(.phases[]?; .status == "failed") then "failed" elif .finished_at then "ok" else "unfinished" end),
+             phases}' <<<"$last_state" > "$target_dir/install-timing.json" 2>/dev/null || true
+      fi
+    fi
+
+    if [[ "$ready" != "true" ]]; then
+      [[ -t 1 ]] && printf '\033[?25h'
+      echo "" >&2
+      echo "ERROR: Timed out after ${install_timeout}s waiting for '$inst_name' installation to finish." >&2
+      echo "  Domain state: $(virsh -c "$URI" domstate "$vm_name" 2>/dev/null | head -n 1 || echo unknown) ($vm_name)" >&2
+      echo "  Guest IP:     ${ip:-none}" >&2
+      [[ -n "${probe_err:-}" ]] && echo "  Last SSH probe: ${probe_err//$'\n'/ | }" >&2
+      echo "  Instance dir: $target_dir (disk.raw, cidata.iso, domain.xml, OVMF_VARS.fd kept untouched)" >&2
+      echo "  QEMU log:     /var/log/libvirt/qemu/${vm_name}.log (needs root)" >&2
+      echo "  The VM is left running with the install media attached. To inspect without SSH:" >&2
+      echo "    lso -n $inst_name desktop        # attach the VM display" >&2
+      echo "    virsh -c $URI console $vm_name   # serial console" >&2
+      echo "  Installer log (live ISO): /var/log/omarchy-install.log; installed system: journalctl -b" >&2
+      echo "  Retry waiting only: lso -n $inst_name shell  (after fixing, e.g. ssh-keygen -R <ip> -f $target_dir/known_hosts)" >&2
+      exit 1
+    fi
+
+    if [[ -t 1 ]]; then
+      printf '\033[%dA' "$((ICON_HEIGHT + 3))"
+      draw_omarchy_icon_frame 980 "Securing guest access and detecting VM integration" "integrating intuitive interfaces"
+    else
+      echo -e "\n==> Securing guest access and detecting VM integration ($vm_name @ $ip)..."
+    fi
+    if [[ ! "$INSTALL_USER" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
+      [[ -t 1 ]] && printf '\033[?25h'
+      echo "ERROR: Refusing to write sudoers for unsafe username '$INSTALL_USER'." >&2
+      exit 1
+    fi
+    # Root bootstrap: the password goes only through ssh stdin (first line, consumed by
+    # `sudo -k -S -p ''`), never argv or script source. The script text is passed as a
+    # sudo argument, so commands inside it cannot consume the password stream.
+    read -r -d '' ROOT_BOOTSTRAP <<'ROOT_BOOTSTRAP_EOF' || true
+set -e
+U="$1"
+echo "$U ALL=(ALL) NOPASSWD: ALL" > "/etc/sudoers.d/99-$U-nopasswd"
+chmod 440 "/etc/sudoers.d/99-$U-nopasswd"
+mkdir -p /etc/ssh/sshd_config.d
+cat <<EOF > /etc/ssh/sshd_config.d/99-disable-password.conf
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitRootLogin no
+EOF
+systemctl reload sshd || systemctl restart sshd
+ufw allow 22/tcp comment 'omarchy-sshd' >/dev/null 2>&1 || true
+sed -i 's/^#timeout: .*/timeout: 0/' /boot/limine.conf 2>/dev/null || true
+swapoff /swap/swapfile 2>/dev/null || true
+sed -i '/\/swap\/swapfile/d' /etc/fstab 2>/dev/null || true
+btrfs subvolume delete /swap >/dev/null 2>&1 || rm -f /swap/swapfile 2>/dev/null || true
+# No package sync or upgrade here: DBs are empty and Omarchy requires `omarchy update` for upgrades.
+for pkg in qemu-guest-agent spice-vdagent waypipe; do
+  if pacman -Q "$pkg" >/dev/null 2>&1; then
+    echo "LSO_INTEGRATION installed $pkg"
+  else
+    echo "LSO_INTEGRATION missing $pkg"
+  fi
+done
+if pacman -Q qemu-guest-agent >/dev/null 2>&1; then systemctl start qemu-guest-agent 2>/dev/null || true; fi
+if pacman -Q spice-vdagent >/dev/null 2>&1; then systemctl start spice-vdagentd 2>/dev/null || true; fi
+fstrim -v / >/dev/null 2>&1 || true
+ROOT_BOOTSTRAP_EOF
+    bootstrap_log="$target_dir/bootstrap.log"
+    echo "Securing guest access and detecting VM integration (no package upgrade)" > "$bootstrap_log"
+    if ! printf '%s\n' "$INSTALL_PASS" | ssh "${SSH_OPTS[@]}" "${INSTALL_USER}@${ip}" \
+        "sudo -k -S -p '' bash -c $(printf '%q' "$ROOT_BOOTSTRAP") lso-bootstrap $(printf '%q' "$INSTALL_USER")" >>"$bootstrap_log" 2>&1; then
+      [[ -t 1 ]] && printf '\033[?25h'
+      echo "" >&2
+      echo "ERROR: Post-install guest bootstrap failed (full output below, also in $bootstrap_log):" >&2
+      cat "$bootstrap_log" >&2
+      exit 1
+    fi
+    ssh "${SSH_OPTS[@]}" "${INSTALL_USER}@${ip}" bash -s <<'POST_INSTALL_EOF'
+      omarchy-toggle-idle stay-awake >/dev/null 2>&1 || true
+      sed -i 's/local omarchy_gdk_scale = 2/local omarchy_gdk_scale = 1/' ~/.config/hypr/monitors.lua 2>/dev/null || true
+      sed -i 's/mode = "preferred", position = "auto", scale = omarchy_monitor_scale/mode = "1680x1050@60", position = "auto", scale = 1/' ~/.config/hypr/monitors.lua 2>/dev/null || true
+POST_INSTALL_EOF
+    # Best-effort: prefer the installed system's final official timing JSON over the live-ISO state.
+    if installed_timing="$(ssh "${SSH_OPTS[@]}" "${INSTALL_USER}@${ip}" cat /var/log/omarchy-install-timing.json 2>/dev/null)" \
+        && jq -e . >/dev/null 2>&1 <<<"$installed_timing"; then
+      printf '%s\n' "$installed_timing" > "$target_dir/install-timing.json"
+    fi
+
+    # Eject both live optical disks (installed system already verified over SSH). Edits the
+    # running and persistent config in place, so MAC/UUID/PCI layout stay unchanged.
+    for cd_target in sda sdb; do
+      if ! virsh -c "$URI" change-media "$vm_name" "$cd_target" --eject --force --live --config >/dev/null; then
+        [[ -t 1 ]] && printf '\033[?25h'
+        echo "ERROR: Failed to eject $cd_target from '$vm_name'; install media still attached (cidata credentials seed kept at $cidata_iso)." >&2
+        exit 1
+      fi
+    done
+    virsh -c "$URI" dumpxml --inactive "$vm_name" > "$target_dir/domain.xml.new"
+    if grep -qF -e "$iso_path" -e "$cidata_iso" "$target_dir/domain.xml.new" || grep -qF -e "$iso_path" -e "$cidata_iso" <(virsh -c "$URI" dumpxml "$vm_name"); then
+      rm -f "$target_dir/domain.xml.new"
+      [[ -t 1 ]] && printf '\033[?25h'
+      echo "ERROR: Install media still referenced by '$vm_name' after eject; keeping $cidata_iso." >&2
+      exit 1
+    fi
+    mv "$target_dir/domain.xml.new" "$target_dir/domain.xml"
+    rm -f "$cidata_iso"
+
+    mkdir -p "$LSO_BASE_DIR"
+    printf '%s\n' "$inst_name" > "$LSO_BASE_DIR/current"
+
+    integ_installed="$(sed -n 's/^LSO_INTEGRATION installed //p' "$bootstrap_log" | paste -sd' ' -)"
+    integ_missing="$(sed -n 's/^LSO_INTEGRATION missing //p' "$bootstrap_log" | paste -sd' ' -)"
+    integ_msgs=("VM integration installed: ${integ_installed:-none}")
+    if [[ -n "$integ_missing" ]]; then
+      integ_warn="WARNING: VM integration missing: $integ_missing (clipboard/rootless app streaming not ready). The OS was not upgraded; to add them later run 'omarchy update -y' in the guest, then 'omarchy pkg add qemu-guest-agent spice-vdagent waypipe'."
+      integ_msgs+=("$integ_warn")
+      echo "$integ_warn" >> "$bootstrap_log"
+    fi
+
+    total_secs=$(( $(date +%s) - t0 ))
+    if [[ -t 1 ]]; then
+      printf '\033[%dA' "$((ICON_HEIGHT + 3))"
+      draw_omarchy_icon_frame 1000 "Your tiny Linux kingdom is ready. Long live ${inst_name}!" "Installed in ${total_secs}s. No partitions were harmed (outside this VM)."
+      printf '\033[?25h\n'
+      printf '\033[32m%s\033[0m\n' \
+        "Default instance is now '$inst_name'. Try:" \
+        "  lso shell -n $inst_name" \
+        "  lso desktop -n $inst_name" \
+        "  lso app -n $inst_name foot  (only if waypipe is installed in the guest)" \
+        "${integ_msgs[@]}"
+    else
+      echo "==> Your tiny Linux kingdom is ready. Long live ${inst_name}!"
+      echo "    Installed in ${total_secs}s. No partitions were harmed (outside this VM)."
+      echo "    Default instance is now '$inst_name'. Try:"
+      echo "      lso shell -n $inst_name"
+      echo "      lso desktop -n $inst_name"
+      echo "      lso app -n $inst_name foot  (only if waypipe is installed in the guest)"
+      printf '    %s\n' "${integ_msgs[@]}"
+    fi
+    ;;
+  help|-h|--help)
+    print_lso_banner
+    cat <<EOF
+Usage:
+  lso [-n <name>]                           Open interactive shell inside Omarchy
+  lso list                                  List all installed Omarchy instances and states
+  lso --set-default-to <vm-name>            Set default active Omarchy instance
+  lso shell [command...]                    Open interactive shell, or explicitly run a guest command
+  lso desktop [--fullscreen]                Attach hardware-accelerated Omarchy Hyprland desktop
+  lso desktop --launch [target...]          Launch or focus an app inside the Omarchy Hyprland desktop
+  lso app [list | <cmd...>]                 List GUI apps or stream a single Wayland window to host desktop
+  lso env                                   Show resolved VM context and all LSO file paths (read-only)
+  lso status                                Show VM state, IP, CPU/Memory/Disk usage, and uptime
+  lso stop | reboot | kill                  Control VM power state
+  lso remove [--force] <name>               Remove a VM instance and delete its data in ~/.lso/<name>/
+  lso install [options]                     Install a new Omarchy instance under ~/.lso/<name>/
+
+Install Options:
+  --name, -n <name>                         Instance name under ~/.lso/<name> (default: default)
+  --resource, -r <low|default|high>         Resource preset:
+                                              low:     2 vCPUs, 3072 MiB RAM, 36 GiB disk
+                                              default: 4 vCPUs, 4096 MiB RAM, 40 GiB disk
+                                              high:    8 vCPUs, 8192 MiB RAM, 64 GiB disk
+  --cpus <n> / --memory <MiB> / --disk <G>  Override individual resource limits
+  --oobe                                    Defer user creation to first-boot OOBE wizard
+  --with-head                               Open display window during installation (default: headless)
+  --iso <path>                              Local Omarchy ISO. Order: this path if present and nonempty, else
+                                            ~/.lso/cache/omarchy-4.0.6.iso, else download
+                                            https://iso.omarchy.org/omarchy-4.0.6.iso (~6 GiB) there (needs curl)
+  --force, -f                               Overwrite existing instance disk
+  --check                                   Run host command & runtime preflight checks only
+EOF
+    ;;
+  *)
+    echo "Unknown command: $cmd" >&2
+    echo "Use lso shell <command...> to run a guest command; lso --help for usage" >&2
+    exit 2
+    ;;
+esac
