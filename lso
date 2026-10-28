@@ -10,17 +10,115 @@ if [[ -n "$LSO_LEGACY_HOME" && "$LSO_LEGACY_HOME" != /* ]]; then
   exit 1
 fi
 
+command_usage() {
+  case "$1" in
+    global)  echo "Usage: lso [-n <name>] [shell|desktop|app|list|status|ip|stop|kill|reboot|remove|install|env|help] ..." ;;
+    shell|sh)   echo "Usage: lso shell [-n <name>] [--] [command...]" ;;
+    desktop|gui|attach) echo "Usage: lso desktop [-n <name>] [--fullscreen|-f] [--reattach|-r]"
+             echo "       lso desktop [-n <name>] [--fullscreen|-f] [--reattach|-r] --launch [target...]" ;;
+    app|apps)   echo "Usage: lso app [-n <name>] [list | [--] <command...>]" ;;
+    list)    echo "Usage: lso list" ;;
+    env)     echo "Usage: lso env [-n <name>]" ;;
+    status|st)  echo "Usage: lso status [-n <name>]" ;;
+    ip)      echo "Usage: lso ip [-n <name>]" ;;
+    stop|shutdown|down) echo "Usage: lso stop [-n <name>]" ;;
+    kill)    echo "Usage: lso kill [-n <name>]" ;;
+    reboot|restart) echo "Usage: lso reboot [-n <name>]" ;;
+    set-default) echo "Usage: lso --set-default-to <name>" ;;
+    remove)  echo "Usage: lso remove [--force|-f|-y|--yes] [-n <name> | <name>]" ;;
+    install) echo "Usage: lso install [-n <name>] [-r <low|default|high>] [-c <cpus>] [-m <MiB>] [-d <GiB>]"
+             echo "                   [-u <user>] [-p <password>] [--iso <path>] [--oobe] [--with-head] [--force|-f] [--check]" ;;
+  esac
+}
+
+# usage_error <command-key> <message>: plain error + usage hint, exit 2 (before any VM/SSH work).
+usage_error() {
+  echo "$2" >&2
+  command_usage "$1" >&2
+  echo "Run 'lso --help' for all options." >&2
+  exit 2
+}
+
+# unknown_option <command-key> <label> <option> [valid-long-option...]
+unknown_option() {
+  local key="$1" label="$2" bad="$3" cand norm_bad norm_cand
+  shift 3
+  echo "Unknown option for $label: $bad" >&2
+  norm_bad="${bad%%=*}"
+  norm_bad="${norm_bad#-}"; norm_bad="${norm_bad#-}"; norm_bad="${norm_bad//-/}"
+  if [[ "$bad" == --* && ${#norm_bad} -ge 3 ]]; then
+    for cand in "$@"; do
+      norm_cand="${cand#--}"; norm_cand="${norm_cand//-/}"
+      if [[ "$norm_cand" == "$norm_bad"* ]]; then
+        echo "Did you mean $cand?" >&2
+        break
+      fi
+    done
+  fi
+  command_usage "$key" >&2
+  echo "Run 'lso --help' for all options." >&2
+  exit 2
+}
+
+# no_extra_args <command-key> <label> [args...]: reject anything left after a command that takes none.
+no_extra_args() {
+  local key="$1" label="$2"
+  shift 2
+  [[ $# -gt 0 ]] || return 0
+  if [[ "$1" == -* ]]; then
+    unknown_option "$key" "$label" "$1"
+  fi
+  usage_error "$key" "Unexpected argument for $label: $1"
+}
+
+validate_instance_name() {
+  local key="$1" opt="$2" value="$3"
+  if [[ -z "$value" || "$value" == -* ]]; then
+    usage_error "$key" "Option $opt requires an instance name."
+  fi
+  if [[ ! "$value" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ || "$value" == *..* ]]; then
+    echo "Invalid instance name '$value' (use letters, digits, '.', '_', '-'; no '/' or '..')." >&2
+    exit 2
+  fi
+}
+
+# opt_value <command-key> <option-as-typed> [next-arg...]: sets OPT_VAL and OPT_SHIFT (args to consume).
+# Accepts "--opt value" and "--opt=value"; the value may not be empty or option-like (except passwords).
+opt_value() {
+  local key="$1" arg="$2" opt
+  opt="${arg%%=*}"
+  if [[ "$arg" == --*=* ]]; then
+    OPT_VAL="${arg#*=}"
+    OPT_SHIFT=1
+  elif [[ $# -ge 3 ]]; then
+    OPT_VAL="$3"
+    OPT_SHIFT=2
+  else
+    usage_error "$key" "Option $opt requires a value."
+  fi
+  if [[ -z "$OPT_VAL" ]]; then
+    usage_error "$key" "Option $opt requires a non-empty value."
+  fi
+  if [[ "$OPT_VAL" == -* && "$opt" != "--password" && "$opt" != "-p" ]]; then
+    usage_error "$key" "Option $opt requires a value, got '$OPT_VAL'."
+  fi
+}
+
 # Global flags before subcommand: lso [-n|--name <name>] <subcommand> ...
 TARGET_NAME="${LSO_NAME:-}"
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -n|--name)
-      TARGET_NAME="$2"
-      shift 2
+    -n|--name|--name=*)
+      opt_value global "$@"
+      validate_instance_name global "${1%%=*}" "$OPT_VAL"
+      TARGET_NAME="$OPT_VAL"
+      shift "$OPT_SHIFT"
       ;;
-    --name=*)
-      TARGET_NAME="${1#*=}"
-      shift
+    -h|--help|--set-default-to|--set-default-to=*)
+      break
+      ;;
+    -*)
+      unknown_option global lso "$1" --name --help --set-default-to
       ;;
     *)
       break
@@ -119,7 +217,7 @@ apply_resource_preset() {
       ;;
     *)
       echo "ERROR: Unknown --resource preset '$preset' (use: low, default, high)" >&2
-      exit 1
+      exit 2
       ;;
   esac
 }
@@ -361,7 +459,7 @@ OMARCHY_WHIMSY=(
 
 print_lso_banner() {
   local LC_ALL=C.UTF-8
-  local subtitle="${1:-handy and funny setup helper}"
+  local subtitle="${1:-Helping Linux hosts host happy Omarchy guests}"
   local title='Linux Subsystem for Omarchy (LSO)'
 
   local c=$'\e[38;2;125;207;255m' d=$'\e[38;2;86;95;137m' r=$'\e[0m' i
@@ -555,12 +653,13 @@ EOF
 
 open_desktop() {
   local mode="${1:-window}"
+  local reattach="${2:-false}"
   # No SSH wait: the display is the recovery path when the guest is not
   # reachable over SSH (installer screen, OOBE, boot problems).
   start_vm_if_needed
   ensure_shortcut_inhibit_allowed
   if pgrep -f "virt-viewer.*$VM" >/dev/null 2>&1; then
-    if [[ "${2:-}" == "--reattach" || "${2:-}" == "-r" || "$mode" == "--fullscreen" || "$mode" == "-f" ]]; then
+    if [[ "$reattach" == "true" || "$mode" == "fullscreen" ]]; then
       pkill -f "virt-viewer.*$VM" 2>/dev/null || true
       sleep 0.2
     else
@@ -581,7 +680,7 @@ open_desktop() {
     "$VM"
   )
   local label="window"
-  if [[ "$mode" == "--fullscreen" || "$mode" == "-f" ]]; then
+  if [[ "$mode" == "fullscreen" ]]; then
     args=(--full-screen "${args[@]}")
     label="fullscreen"
   fi
@@ -827,8 +926,9 @@ write_domain_xml() {
   local cidata_iso="${6:-}"
   local domain_uuid
   domain_uuid="$(resolve_domain_uuid "$target_dir" "$vm_name")"
-  local cores=$(( cpus >= 2 ? cpus / 2 : 1 ))
-  local threads=$(( cpus >= 2 ? 2 : 1 ))
+  # One socket, cores*threads == cpus: pair threads only when cpus is even.
+  local threads=$(( cpus >= 2 && cpus % 2 == 0 ? 2 : 1 ))
+  local cores=$(( cpus / threads ))
   local render_node
   render_node="$(ls /dev/dri/by-path/*-render 2>/dev/null | head -n 1 || echo "/dev/dri/renderD128")"
 
@@ -1030,10 +1130,10 @@ refresh_instance_env
 set_default_instance() {
   local target="${1:-}"
   if [[ -z "$target" ]]; then
-    echo "Usage: lso --set-default-to <vm-name>" >&2
-    exit 1
+    usage_error set-default "Option --set-default-to requires an instance name."
   fi
   target="${target#lso-}"
+  validate_instance_name set-default --set-default-to "$target"
   if [[ "$target" == "omarchy-vm" && -n "$LSO_LEGACY_HOME" && -f "$LSO_LEGACY_HOME/omarchy-vm.xml" ]]; then
     rm -f "$LSO_BASE_DIR/current"
     echo "Default instance set to omarchy-vm ($LSO_LEGACY_HOME)."
@@ -1093,11 +1193,10 @@ case "$cmd" in
     if (( $# > 0 )); then shift; fi
     while [[ $# -gt 0 ]]; do
       case "$1" in
-        -n|--name)
-          [[ $# -ge 2 ]] || { echo "ERROR: $1 requires a value" >&2; exit 1; }
-          resolve_instance "$2"; refresh_instance_env; shift 2 ;;
-        --name=*)
-          resolve_instance "${1#*=}"; refresh_instance_env; shift ;;
+        -n|--name|--name=*)
+          opt_value "$cmd" "$@"
+          validate_instance_name "$cmd" "${1%%=*}" "$OPT_VAL"
+          resolve_instance "$OPT_VAL"; refresh_instance_env; shift "$OPT_SHIFT" ;;
         *) break ;;
       esac
     done
@@ -1107,21 +1206,29 @@ esac
 
 case "$cmd" in
   env)
+    shift
+    no_extra_args env "lso env" "$@"
     show_env
     ;;
   list|ls)
+    shift
+    no_extra_args list "lso list" "$@"
     list_instances
     ;;
   --set-default-to|use|switch)
     shift
+    [[ $# -le 1 ]] || usage_error set-default "Unexpected argument for $cmd: $2"
     set_default_instance "${1:-}"
     ;;
   --set-default-to=*)
+    shift
+    no_extra_args set-default "lso --set-default-to" "$@"
     set_default_instance "${cmd#*=}"
     ;;
   shell|sh)
+    shift
+    if [[ "${1:-}" == "--" ]]; then shift; fi
     ip="$(ensure_running)"
-    shift $(( $# >= 1 ? 1 : 0 ))
     if [[ $# -eq 0 ]]; then
       exec ssh "${SSH_OPTS[@]}" "${GUEST_USER}@${ip}"
     else
@@ -1130,15 +1237,29 @@ case "$cmd" in
     ;;
   desktop|gui|attach)
     shift
-    case "${1:-}" in
-      --launch|-l)
-        shift
-        ip="$(ensure_running)"
-        if [[ $# -eq 0 ]]; then
-          exec ssh "${SSH_OPTS[@]}" "${GUEST_USER}@${ip}" "source /etc/profile; omarchy launch --help"
-        fi
-        open_desktop "window"
-        exec ssh "${SSH_OPTS[@]}" "${GUEST_USER}@${ip}" bash -l -s -- "$@" <<'REMOTE_EOF'
+    d_mode=window
+    d_reattach=false
+    d_launch=false
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --fullscreen|-f) d_mode=fullscreen; shift ;;
+        --reattach|-r)   d_reattach=true; shift ;;
+        --launch|-l)     d_launch=true; shift; break ;;
+        -n|--name|--name=*)
+          opt_value desktop "$@"
+          validate_instance_name desktop "${1%%=*}" "$OPT_VAL"
+          resolve_instance "$OPT_VAL"; refresh_instance_env; shift "$OPT_SHIFT" ;;
+        -*) unknown_option desktop "$cmd" "$1" --fullscreen --reattach --launch --name ;;
+        *)  usage_error desktop "Unexpected argument for $cmd: $1" ;;
+      esac
+    done
+    if [[ "$d_launch" == "true" ]]; then
+      ip="$(ensure_running)"
+      if [[ $# -eq 0 ]]; then
+        exec ssh "${SSH_OPTS[@]}" "${GUEST_USER}@${ip}" "source /etc/profile; omarchy launch --help"
+      fi
+      open_desktop "$d_mode" "$d_reattach"
+      exec ssh "${SSH_OPTS[@]}" "${GUEST_USER}@${ip}" bash -l -s -- "$@" <<'REMOTE_EOF'
           while IFS= read -r -d '' kv; do
             export "$kv" 2>/dev/null || true
           done < <(systemctl --user show-environment -z)
@@ -1150,18 +1271,23 @@ case "$cmd" in
             nohup omarchy-launch-or-focus "$1" "uwsm-app -- $*" >/dev/null 2>&1 &
           fi
 REMOTE_EOF
-        ;;
-      --fullscreen|-f)
-        open_desktop "--fullscreen" "${2:-}"
-        ;;
-      *)
-        open_desktop "window" "${1:-}"
-        ;;
-    esac
+    else
+      open_desktop "$d_mode" "$d_reattach"
+    fi
     ;;
   app|apps)
     shift
-    if [[ $# -eq 0 || "${1:-}" == "list" || "${1:-}" == "--list" || "${1:-}" == "-l" ]]; then
+    app_list=false
+    if [[ "${1:-}" == "--" ]]; then
+      shift
+      [[ $# -gt 0 ]] || usage_error app "Missing command after '--'."
+    elif [[ $# -eq 0 ]]; then
+      app_list=true
+    elif [[ "$1" == "list" || "$1" == "--list" || "$1" == "-l" ]]; then
+      [[ $# -eq 1 ]] || usage_error app "Unexpected argument for app list: $2"
+      app_list=true
+    fi
+    if [[ "$app_list" == "true" ]]; then
       ip="$(ensure_running)"
       echo "Available GUI apps in Omarchy ($VM, run with: lso app <command>):"
       printf "  %-24s %s\n" "COMMAND" "NAME"
@@ -1212,6 +1338,7 @@ REMOTE_EOF
     ;;
   status|st)
     shift
+    no_extra_args status "lso status" "$@"
     state="$(virsh -c "$URI" domstate "$VM" 2>/dev/null || echo "undefined")"
     ip="$(get_ip || true)"
     vcpus="$(virsh -c "$URI" dominfo "$VM" 2>/dev/null | awk -F: '/^CPU\(s\)/ {gsub(/^[ \t]+/, "", $2); print $2}')"
@@ -1246,15 +1373,23 @@ REMOTE_STATUS
     fi
     ;;
   ip)
+    shift
+    no_extra_args ip "lso ip" "$@"
     get_ip
     ;;
   stop|shutdown|down)
+    shift
+    no_extra_args stop "lso $cmd" "$@"
     virsh -c "$URI" shutdown "$VM"
     ;;
   kill)
+    shift
+    no_extra_args kill "lso kill" "$@"
     virsh -c "$URI" destroy "$VM"
     ;;
   reboot|restart)
+    shift
+    no_extra_args reboot "lso $cmd" "$@"
     ip="$(ensure_running)"
     ssh "${SSH_OPTS[@]}" "${GUEST_USER}@${ip}" "sudo reboot" || true
     ;;
@@ -1262,22 +1397,27 @@ REMOTE_STATUS
     shift
     rm_force=false
     rm_name="${TARGET_NAME:-}"
+    rm_names_given=0
     while [[ $# -gt 0 ]]; do
       case "$1" in
-        --name|-n)   rm_name="$2"; shift 2 ;;
-        --name=*)    rm_name="${1#*=}"; shift ;;
+        --name|-n|--name=*)
+          opt_value remove "$@"
+          rm_name="$OPT_VAL"; rm_names_given=$((rm_names_given + 1)); shift "$OPT_SHIFT" ;;
         --force|-f|-y|--yes) rm_force=true; shift ;;
-        *)           rm_name="$1"; shift ;;
+        -*)          unknown_option remove "lso $cmd" "$1" --name --force --yes ;;
+        *)           rm_name="$1"; rm_names_given=$((rm_names_given + 1)); shift ;;
       esac
+      (( rm_names_given <= 1 )) || usage_error remove "Multiple instance names given; remove takes exactly one."
     done
 
     if [[ -z "$rm_name" ]]; then
-      echo "Usage: lso remove [--force] <name>" >&2
+      command_usage remove >&2
       echo "Run 'lso list' to see installed instances." >&2
-      exit 1
+      exit 2
     fi
 
     rm_name="${rm_name#lso-}"
+    validate_instance_name remove "<name>" "$rm_name"
     if [[ "$rm_name" == "omarchy-vm" ]]; then
       echo "ERROR: Refusing to auto-delete the base workspace VM 'omarchy-vm'${LSO_LEGACY_HOME:+ ($LSO_LEGACY_HOME)}." >&2
       exit 1
@@ -1327,21 +1467,36 @@ REMOTE_STATUS
 
     while [[ $# -gt 0 ]]; do
       case "$1" in
-        --name|-n)      inst_name="$2"; shift 2 ;;
-        --name=*)       inst_name="${1#*=}"; shift ;;
-        --resource|-r)  resource_preset="$2"; shift 2 ;;
-        --resource=*)   resource_preset="${1#*=}"; shift ;;
-        --cpus|-c)      custom_cpus="$2"; shift 2 ;;
-        --memory|-m)    custom_ram_mib="$2"; shift 2 ;;
-        --disk|-d)      custom_disk_gib="$2"; shift 2 ;;
-        --user|-u)      export LSO_INSTALL_USER="$2"; shift 2 ;;
-        --password|-p)  export LSO_INSTALL_PASS="$2"; shift 2 ;;
+        --name|-n|--name=*)
+          opt_value install "$@"; validate_instance_name install "${1%%=*}" "$OPT_VAL"
+          inst_name="$OPT_VAL"; shift "$OPT_SHIFT" ;;
+        --resource|-r|--resource=*)
+          opt_value install "$@"; resource_preset="$OPT_VAL"; shift "$OPT_SHIFT" ;;
+        --cpus|-c|--cpus=*)
+          opt_value install "$@"; custom_cpus="$OPT_VAL"; shift "$OPT_SHIFT" ;;
+        --memory|-m|--memory=*)
+          opt_value install "$@"; custom_ram_mib="$OPT_VAL"; shift "$OPT_SHIFT" ;;
+        --disk|-d|--disk=*)
+          opt_value install "$@"; custom_disk_gib="$OPT_VAL"; shift "$OPT_SHIFT" ;;
+        --user|-u|--user=*)
+          opt_value install "$@"
+          if [[ ! "$OPT_VAL" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
+            echo "Invalid username '$OPT_VAL' (use lowercase letters, digits, '_', or '-')." >&2
+            exit 2
+          fi
+          export LSO_INSTALL_USER="$OPT_VAL"; shift "$OPT_SHIFT" ;;
+        --password|-p|--password=*)
+          opt_value install "$@"; export LSO_INSTALL_PASS="$OPT_VAL"; shift "$OPT_SHIFT" ;;
         --force|-f)     force=true; shift ;;
         --oobe)         oobe=true; shift ;;
         --with-head)    with_head=true; shift ;;
-        --iso)          iso_path="$(readlink -f "$2")"; iso_explicit=true; shift 2 ;;
+        --iso|--iso=*)
+          opt_value install "$@"; iso_path="$(readlink -f "$OPT_VAL")"; iso_explicit=true; shift "$OPT_SHIFT" ;;
         --check)        check_only=true; shift ;;
-        *)              iso_path="$(readlink -f "$1")"; iso_explicit=true; shift ;;
+        -*)             unknown_option install "lso install" "$1" --name --resource --cpus --memory --disk --user --password --iso --oobe --with-head --force --check ;;
+        *)
+          [[ "$iso_explicit" != "true" ]] || usage_error install "Unexpected argument for lso install: $1"
+          iso_path="$(readlink -f "$1")"; iso_explicit=true; shift ;;
       esac
     done
 
@@ -1349,6 +1504,15 @@ REMOTE_STATUS
     [[ -n "$custom_cpus" ]] && INSTALL_CPUS="$custom_cpus"
     [[ -n "$custom_ram_mib" ]] && INSTALL_RAM_MIB="$custom_ram_mib"
     [[ -n "$custom_disk_gib" ]] && INSTALL_DISK_GIB="$custom_disk_gib"
+    if [[ ! "$INSTALL_CPUS" =~ ^[1-9][0-9]{0,3}$ ]]; then
+      usage_error install "Invalid --cpus '$INSTALL_CPUS' (use a positive whole number)."
+    fi
+    if [[ ! "$INSTALL_RAM_MIB" =~ ^[1-9][0-9]{0,6}$ ]] || (( INSTALL_RAM_MIB < 3072 )); then
+      usage_error install "Invalid --memory '$INSTALL_RAM_MIB' (MiB, whole number, at least 3072)."
+    fi
+    if [[ ! "$INSTALL_DISK_GIB" =~ ^[1-9][0-9]{0,5}$ ]] || (( INSTALL_DISK_GIB < 36 )); then
+      usage_error install "Invalid --disk '$INSTALL_DISK_GIB' (GiB, whole number, at least 36)."
+    fi
 
     # Precedence: (1) usable explicit ISO, (2) cached default ISO, (3) download into the cache.
     iso_mode=default-iso
@@ -1358,11 +1522,7 @@ REMOTE_STATUS
     check_host_requirements "$iso_mode"
     [[ "$check_only" != "true" ]] || exit 0
 
-
-    if [[ ! "$inst_name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ || "$inst_name" == *..* ]]; then
-      echo "ERROR: Invalid instance name '$inst_name' (use letters, digits, '.', '_', '-'; no '/' or '..')." >&2
-      exit 1
-    fi
+    validate_instance_name install "--name" "$inst_name"
 
     target_dir="$LSO_BASE_DIR/$inst_name"
     vm_name="lso-$inst_name"
