@@ -129,7 +129,6 @@ done
 resolve_instance() {
   local name="${1:-}"
 
-  # Explicit instance name
   if [[ -n "$name" ]]; then
     if [[ "$name" == "omarchy-vm" || "$name" == "default" ]] && [[ -n "$LSO_LEGACY_HOME" && -f "$LSO_LEGACY_HOME/omarchy-vm.xml" && ! -d "$LSO_BASE_DIR/$name" ]]; then
       VM="omarchy-vm"
@@ -222,38 +221,99 @@ apply_resource_preset() {
   esac
 }
 
-LSO_DEFAULT_ISO_URL="https://iso.omarchy.org/omarchy-4.0.6.iso"
+LSO_LATEST_RELEASE_API="https://api.github.com/repos/omacom/omarchy/releases/latest"
+LSO_ISO_BASE_URL="https://iso.omarchy.org"
 
-# Print the default cached ISO path (never touches the script install dir).
-default_iso_cache_path() {
-  printf '%s\n' "$LSO_BASE_DIR/cache/omarchy-4.0.6.iso"
+# Resolved by resolve_latest_iso: latest stable version, official ISO URL, published SHA256 (may be empty).
+LSO_LATEST_VERSION=""
+LSO_LATEST_ISO_URL=""
+LSO_LATEST_ISO_SHA256=""
+
+# Print the versioned cached ISO path (never touches the script install dir).
+# Usage: versioned_iso_cache_path <version>
+versioned_iso_cache_path() {
+  printf '%s\n' "$LSO_BASE_DIR/cache/omarchy-$1.iso"
 }
 
-# Download the pinned default ISO into the cache unless a nonempty copy exists.
-# The final filename only appears after curl succeeds and the file is nonempty.
-# This is a basic completeness check, not cryptographic verification.
-ensure_default_iso() {
-  local dest part cache_dir
-  dest="$(default_iso_cache_path)"
-  part="$dest.part"
-  cache_dir="$(dirname "$dest")"
-  if [[ -s "$dest" ]]; then
-    echo "==> Using cached Omarchy ISO: $dest"
-    return 0
-  fi
-  if ! command -v curl >/dev/null 2>&1; then
-    echo "ERROR: curl is required to download the default Omarchy ISO (sudo apt-get install -y curl), or pass --iso /path/to/omarchy.iso" >&2
+# Query GitHub's latest stable release (drafts/prereleases are never returned or accepted)
+# and extract version, official ISO URL and published SHA256 from the release notes.
+# Release assets are not used; the ISO is hosted at iso.omarchy.org.
+resolve_latest_iso() {
+  local json meta tag draft prerelease version body url sha
+  echo "==> Checking latest stable Omarchy release (https://github.com/omacom/omarchy/releases)"
+  if ! json="$(curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
+      --connect-timeout 15 --max-time 60 -H 'Accept: application/vnd.github+json' "$LSO_LATEST_RELEASE_API")"; then
+    echo "ERROR: Could not determine the latest stable Omarchy release; no VM or disk was created." >&2
+    echo "  Check your network and retry 'lso install'. A cached older ISO is not assumed to be the latest." >&2
+    echo "  To install offline from a cached or downloaded ISO, pass it explicitly: lso install --iso ~/.lso/cache/omarchy-<version>.iso" >&2
     exit 1
   fi
-  mkdir -p "$cache_dir"
+  if ! meta="$(jq -r '[(.tag_name // ""), (.draft | tostring), (.prerelease | tostring)] | join("\n")' <<<"$json" 2>/dev/null)"; then
+    echo "ERROR: Unusable latest-release metadata from GitHub (invalid JSON); no VM or disk was created." >&2
+    exit 1
+  fi
+  { read -r tag; read -r draft; read -r prerelease; } <<<"$meta"
+  if [[ "$draft" != "false" || "$prerelease" != "false" ]]; then
+    echo "ERROR: GitHub latest release '$tag' is not a stable release; refusing to use it. Pass --iso /path/to/omarchy.iso instead." >&2
+    exit 1
+  fi
+  if [[ ! "$tag" =~ ^v?([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+    echo "ERROR: Latest release tag '$tag' is not a numeric version (expected e.g. v4.0.6); refusing to guess. Pass --iso /path/to/omarchy.iso instead." >&2
+    exit 1
+  fi
+  version="${BASH_REMATCH[1]}"
+  body="$(jq -r '.body // ""' <<<"$json" | tr -d '\r')"
+  url="$LSO_ISO_BASE_URL/omarchy-$version.iso"
+  if ! grep -qF -- "$url" <<<"$body"; then
+    echo "NOTE: Release notes for v$version do not link the ISO; using the standard official URL $url" >&2
+  fi
+  sha="$(sed -nE 's/^[[:space:]]*[-*]?[[:space:]]*SHA256:[[:space:]]*`?([0-9a-fA-F]{64})`?[[:space:]]*$/\1/p' <<<"$body" | head -n 1 | tr 'A-F' 'a-f')"
+  LSO_LATEST_VERSION="$version"
+  LSO_LATEST_ISO_URL="$url"
+  LSO_LATEST_ISO_SHA256="$sha"
+  echo "==> Latest stable Omarchy release: v$version"
+}
+
+# Usage: iso_sha256_matches <file> <expected-lowercase-hex>
+iso_sha256_matches() {
+  local actual
+  actual="$(sha256sum -- "$1" | awk '{print tolower($1)}')"
+  [[ "$actual" == "$2" ]]
+}
+
+# Resolve the latest stable ISO, then reuse a verified versioned cache copy or download it.
+# The final filename only appears after curl succeeds, the file is nonempty and (when
+# published) its SHA256 matches. Sets iso_path (caller's variable) to the cached file.
+ensure_latest_iso() {
+  local dest part
+  resolve_latest_iso
+  dest="$(versioned_iso_cache_path "$LSO_LATEST_VERSION")"
+  part="$dest.part"
+  iso_path="$dest"
+  if [[ -s "$dest" ]]; then
+    echo "==> Found cached Omarchy $LSO_LATEST_VERSION ISO: $dest"
+    if [[ -n "$LSO_LATEST_ISO_SHA256" ]]; then
+      echo "==> Verifying SHA256 of cached ISO..."
+      if ! iso_sha256_matches "$dest" "$LSO_LATEST_ISO_SHA256"; then
+        echo "ERROR: Cached ISO $dest does not match the published SHA256 ($LSO_LATEST_ISO_SHA256); no VM or disk was created." >&2
+        echo "  The file was left untouched. Remove it and retry 'lso install' to download again." >&2
+        exit 1
+      fi
+      echo "==> SHA256 verified; using cached ISO"
+    else
+      echo "WARNING: No published SHA256 for v$LSO_LATEST_VERSION; cached ISO is only checked to be nonempty." >&2
+    fi
+    return 0
+  fi
+  mkdir -p "$(dirname "$dest")"
   rm -f "$part"
-  echo "==> Downloading Omarchy ISO (~6 GiB) from $LSO_DEFAULT_ISO_URL"
+  echo "==> Downloading Omarchy $LSO_LATEST_VERSION ISO (~6 GiB) from $LSO_LATEST_ISO_URL"
   echo "    Saving to: $dest"
   local progress=(--silent)
   [[ -t 2 ]] && progress=(--progress-bar)
-  if ! curl --fail --location --show-error "${progress[@]}" --output "$part" "$LSO_DEFAULT_ISO_URL"; then
+  if ! curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 --show-error "${progress[@]}" --output "$part" "$LSO_LATEST_ISO_URL"; then
     rm -f "$part"
-    echo "ERROR: Download of $LSO_DEFAULT_ISO_URL failed; no VM or disk was created." >&2
+    echo "ERROR: Download of $LSO_LATEST_ISO_URL failed; no VM or disk was created." >&2
     echo "  Check your network and retry 'lso install', or download the ISO yourself and pass: lso install --iso /path/to/omarchy.iso" >&2
     exit 1
   fi
@@ -262,12 +322,23 @@ ensure_default_iso() {
     echo "ERROR: Downloaded ISO is empty; no VM or disk was created. Retry 'lso install' or pass --iso /path/to/omarchy.iso" >&2
     exit 1
   fi
+  if [[ -n "$LSO_LATEST_ISO_SHA256" ]]; then
+    echo "==> Verifying SHA256 of downloaded ISO..."
+    if ! iso_sha256_matches "$part" "$LSO_LATEST_ISO_SHA256"; then
+      rm -f "$part"
+      echo "ERROR: Downloaded ISO does not match the published SHA256 ($LSO_LATEST_ISO_SHA256); discarded. No VM or disk was created. Retry 'lso install'." >&2
+      exit 1
+    fi
+    echo "==> SHA256 verified"
+  else
+    echo "WARNING: No published SHA256 for v$LSO_LATEST_VERSION; downloaded ISO is only checked to be nonempty." >&2
+  fi
   mv -f "$part" "$dest"
-  echo "==> Downloaded $dest (size check only; contents are not cryptographically verified)"
+  echo "==> Downloaded $dest"
 }
 
 # Usage: check_host_requirements [default-iso]
-# Pass "default-iso" when no explicit ISO was given, so curl is checked only if a download is needed.
+# Pass "default-iso" when no usable explicit ISO was given: automatic latest-stable lookup then needs curl and sha256sum.
 check_host_requirements() {
   local iso_mode="${1:-}"
   local failed=0
@@ -302,14 +373,22 @@ check_host_requirements() {
 
   if [[ "$iso_mode" != "default-iso" ]]; then
     _pf_row "[SKIP]" "curl" "not needed (usable local ISO supplied)"
-  elif [[ -s "$(default_iso_cache_path)" ]]; then
-    _pf_row "[SKIP]" "curl" "not needed (cached ISO: $(default_iso_cache_path))"
-  elif path="$(command -v curl 2>/dev/null)"; then
-    _pf_row "[OK]" "curl" "$path (will download default ISO)"
+    _pf_row "[SKIP]" "sha256sum" "not needed (usable local ISO supplied)"
   else
-    _pf_row "[MISSING]" "curl" "required to download default ISO (sudo apt-get install -y curl)"
-    missing+=("curl")
-    failed=1
+    if path="$(command -v curl 2>/dev/null)"; then
+      _pf_row "[OK]" "curl" "$path (latest stable lookup/download)"
+    else
+      _pf_row "[MISSING]" "curl" "required to look up the latest stable ISO (sudo apt-get install -y curl)"
+      missing+=("curl")
+      failed=1
+    fi
+    if path="$(command -v sha256sum 2>/dev/null)"; then
+      _pf_row "[OK]" "sha256sum" "$path (ISO verification)"
+    else
+      _pf_row "[MISSING]" "sha256sum" "required to verify the ISO (sudo apt-get install -y coreutils)"
+      missing+=("sha256sum")
+      failed=1
+    fi
   fi
 
   if [[ -r /dev/kvm && -w /dev/kvm ]]; then
@@ -397,8 +476,7 @@ is_running() {
   virsh -c "$URI" domstate "$VM" 2>/dev/null | grep -q "running"
 }
 
-# Start the domain if needed without waiting for SSH, so the display can be
-# attached to inspect an installer/OOBE/boot screen even when SSH is unusable.
+# Does not wait for SSH so the display stays usable when SSH is not.
 start_vm_if_needed() {
   if ! is_running; then
     if [[ ! -f "$XML_FILE" ]]; then
@@ -654,8 +732,6 @@ EOF
 open_desktop() {
   local mode="${1:-window}"
   local reattach="${2:-false}"
-  # No SSH wait: the display is the recovery path when the guest is not
-  # reachable over SSH (installer screen, OOBE, boot problems).
   start_vm_if_needed
   ensure_shortcut_inhibit_allowed
   if pgrep -f "virt-viewer.*$VM" >/dev/null 2>&1; then
@@ -1084,17 +1160,14 @@ list_instances() {
     printf "%s %-16s %-16s %-12s %-16s %-16s %s\n" "$mark" "$inst_name" "$dom_name" "$state" "${ip:--}" "$res" "$dir_path"
   }
 
-  # 1. Explicit legacy omarchy-vm (only when LSO_LEGACY_HOME is set)
   if [[ -n "$LSO_LEGACY_HOME" && -f "$LSO_LEGACY_HOME/omarchy-vm.xml" ]]; then
     print_row "omarchy-vm" "omarchy-vm" "$LSO_LEGACY_HOME"
   fi
 
-  # 2. Direct ~/.lso/domain.xml
   if [[ -f "$LSO_BASE_DIR/domain.xml" ]]; then
     print_row "default" "lso-vm" "$LSO_BASE_DIR"
   fi
 
-  # 3. Named instances under ~/.lso/<name>/domain.xml
   local xml
   for xml in "$LSO_BASE_DIR"/*/domain.xml; do
     [[ -f "$xml" ]] || continue
@@ -1461,7 +1534,7 @@ REMOTE_STATUS
     custom_cpus=""
     custom_ram_mib=""
     custom_disk_gib=""
-    iso_path="$(default_iso_cache_path)"
+    iso_path=""
     iso_explicit=false
     check_only=false
 
@@ -1514,7 +1587,7 @@ REMOTE_STATUS
       usage_error install "Invalid --disk '$INSTALL_DISK_GIB' (GiB, whole number, at least 36)."
     fi
 
-    # Precedence: (1) usable explicit ISO, (2) cached default ISO, (3) download into the cache.
+    # Precedence: (1) usable explicit ISO (override, not checksum-verified), (2) latest stable ISO: versioned cache or download.
     iso_mode=default-iso
     if [[ "$iso_explicit" == "true" && -f "$iso_path" && -s "$iso_path" ]]; then
       iso_mode=explicit-iso
@@ -1546,10 +1619,9 @@ REMOTE_STATUS
 
     if [[ "$iso_mode" == "default-iso" ]]; then
       if [[ "$iso_explicit" == "true" ]]; then
-        echo "WARNING: Supplied ISO '$iso_path' is missing or empty; falling back to the default cached/downloaded ISO." >&2
+        echo "WARNING: Supplied ISO '$iso_path' is missing or empty; falling back to the latest stable Omarchy ISO." >&2
       fi
-      iso_path="$(default_iso_cache_path)"
-      ensure_default_iso
+      ensure_latest_iso
     fi
 
     if [[ "$oobe" != "true" ]]; then
@@ -1657,7 +1729,6 @@ REMOTE_STATUS
         fi
       fi
       disk_used="$(du -sh "$target_dir/disk.raw" 2>/dev/null | awk '{print $1}' || true)"
-      # No installer telemetry is exposed to the host, so show activity only (no percentage).
       pm=$(( (elapsed * 50) % 1000 ))
       whimsy="${OMARCHY_WHIMSY[$(( (elapsed / 4) % ${#OMARCHY_WHIMSY[@]} ))]}"
       if [[ -t 1 ]]; then
@@ -1670,7 +1741,6 @@ REMOTE_STATUS
     done
 
     if [[ "$ready" == "true" ]]; then
-      # Persist official phase timings from the last valid installer state (best-effort refresh first).
       if st="$(qga_tail_file "$vm_name" /run/omarchy-install/state.json 2>/dev/null)" && jq -e . >/dev/null 2>&1 <<<"$st"; then
         last_state="$st"
       fi
@@ -1763,8 +1833,7 @@ POST_INSTALL_EOF
       printf '%s\n' "$installed_timing" > "$target_dir/install-timing.json"
     fi
 
-    # Eject both live optical disks (installed system already verified over SSH). Edits the
-    # running and persistent config in place, so MAC/UUID/PCI layout stay unchanged.
+    # Edit running and persistent config in place to keep MAC/UUID/PCI layout.
     for cd_target in sda sdb; do
       if ! virsh -c "$URI" change-media "$vm_name" "$cd_target" --eject --force --live --config >/dev/null; then
         [[ -t 1 ]] && printf '\033[?25h'
@@ -1841,9 +1910,11 @@ Install Options:
   --cpus <n> / --memory <MiB> / --disk <G>  Override individual resource limits
   --oobe                                    Defer user creation to first-boot OOBE wizard
   --with-head                               Open display window during installation (default: headless)
-  --iso <path>                              Local Omarchy ISO. Order: this path if present and nonempty, else
-                                            ~/.lso/cache/omarchy-4.0.6.iso, else download
-                                            https://iso.omarchy.org/omarchy-4.0.6.iso (~6 GiB) there (needs curl)
+  --iso <path>                              Local Omarchy ISO, used as-is (not checksum-verified) if present
+                                            and nonempty. Otherwise the latest stable release is looked up on
+                                            GitHub (needs curl, sha256sum), then ~/.lso/cache/omarchy-<version>.iso
+                                            is reused or downloaded (~6 GiB) from https://iso.omarchy.org and
+                                            verified against the published SHA256
   --force, -f                               Overwrite existing instance disk
   --check                                   Run host command & runtime preflight checks only
 EOF
